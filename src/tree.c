@@ -569,14 +569,16 @@ DWORD tree_list(const wchar_t *path)
     return error;
 }
 
-DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, BOOL unbuffered)
+DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode)
 {
     COPYFILE2_EXTENDED_PARAMETERS options = {
         sizeof(options), COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK, NULL, NULL, NULL
     };
     HRESULT result;
-    if (unbuffered)
+    if (mode == STDIO_COPY_UNBUFFERED)
         options.dwCopyFlags |= COPY_FILE_NO_BUFFERING;
+    else if (mode == STDIO_COPY_NO_PREALLOCATION)
+        options.dwCopyFlags |= COPY_FILE_DISABLE_PRE_ALLOCATION;
     result = CopyFile2(source, destination, &options);
     return FAILED(result) ? (HRESULT_FACILITY(result) == FACILITY_WIN32 ?
                             HRESULT_CODE(result) : (DWORD)result) : ERROR_SUCCESS;
@@ -584,7 +586,7 @@ DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, BOOL unb
 
 DWORD plain_copy(const wchar_t *source, const wchar_t *destination)
 {
-    return copy_file_mode(source, destination, FALSE);
+    return copy_file_mode(source, destination, STDIO_COPY_BUFFERED);
 }
 
 typedef struct {
@@ -717,7 +719,8 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
                     source[batch->source_length + length] = 0;
                     memcpy(target + batch->target_length, entry->FileName, entry->FileNameLength);
                     target[batch->target_length + length] = 0;
-                    error = copy_file_mode(source, target, unbuffered);
+                    error = copy_file_mode(source, target,
+                                           unbuffered ? STDIO_COPY_UNBUFFERED : STDIO_COPY_BUFFERED);
                 }
                 CloseHandle(pinned);
             }

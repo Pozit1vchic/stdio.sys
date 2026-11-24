@@ -163,7 +163,7 @@ static DWORD hash_file(HANDLE file, BYTE *buffer, BYTE digest[SHA256_BYTES])
     return error ? error : status < 0 ? RtlNtStatusToDosError(status) : ERROR_SUCCESS;
 }
 
-DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, BOOL unbuffered)
+DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode)
 {
     HANDLE input, output = INVALID_HANDLE_VALUE;
     FILE_ATTRIBUTE_TAG_INFO attributes;
@@ -172,6 +172,7 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, BOOL unb
     LARGE_INTEGER length, copied_length, frequency, start, copied, flushed;
     DWORD error;
     unsigned i;
+    const wchar_t *mode_name = L"buffered";
 
     input = CreateFileW(source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                        FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -197,7 +198,7 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, BOOL unb
         goto done;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
-    error = copy_file_mode(source, destination, unbuffered);
+    error = copy_file_mode(source, destination, mode);
     QueryPerformanceCounter(&copied);
     if (error)
         goto done;
@@ -223,8 +224,12 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, BOOL unb
         error = ERROR_CRC;
         goto done;
     }
+    if (mode == STDIO_COPY_UNBUFFERED)
+        mode_name = L"unbuffered";
+    else if (mode == STDIO_COPY_NO_PREALLOCATION)
+        mode_name = L"no-preallocation";
     wprintf(L"bytes=%llu mode=%ls copy_seconds=%.6f copy_and_flush_seconds=%.6f sha256=",
-            (ULONGLONG)length.QuadPart, unbuffered ? L"unbuffered" : L"buffered",
+            (ULONGLONG)length.QuadPart, mode_name,
             (double)(copied.QuadPart - start.QuadPart) / (double)frequency.QuadPart,
             (double)(flushed.QuadPart - start.QuadPart) / (double)frequency.QuadPart);
     for (i = 0; i < SHA256_BYTES; ++i)

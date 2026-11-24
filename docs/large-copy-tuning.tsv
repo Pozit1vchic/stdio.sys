@@ -1,0 +1,7 @@
+mib	variant	copy_seconds	copy_flush_seconds	sha256_matches
+10240	CopyFile2	11.190666	27.233069	true
+10240	no-preallocation	16.838666	20.714504	true
+10240	IOCP-1MiB-buffered-16	16.455914	21.494489	true
+10240	IOCP-16MiB-direct-4	21.245685	21.267544	true
+10240	no-preallocation	12.103200	20.673716	true
+10240	CopyFile2	26.724634	28.742540	true

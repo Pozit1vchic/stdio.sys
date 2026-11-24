@@ -25,7 +25,12 @@ DWORD tree_snapshot(const wchar_t *path, TREE_VISITOR visitor, void *context,
 DWORD storage_workers(const wchar_t *path);
 DWORD storage_info(const wchar_t *path);
 DWORD plain_copy(const wchar_t *source, const wchar_t *destination);
-DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, BOOL unbuffered);
+typedef enum {
+    STDIO_COPY_BUFFERED,
+    STDIO_COPY_UNBUFFERED,
+    STDIO_COPY_NO_PREALLOCATION
+} STDIO_COPY_MODE;
+DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode);
 DWORD copy_new_tree(const wchar_t *source, const wchar_t *destination, DWORD workers,
                     BOOL unbuffered_large, TREE_RESULT *result);
 HRESULT shell_operation(const wchar_t *verb, int count, wchar_t **paths,

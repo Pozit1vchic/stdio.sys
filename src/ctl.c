@@ -36,13 +36,13 @@ static int help(void)
            L"  copy-new NEW_DIRECTORY SOURCE_DIRECTORY [auto|1..16] [--unbuffered-large]\n"
            L"  move DESTINATION SOURCE [SOURCE ...]\n"
            L"  move-new NEW_PATH SOURCE (same volume)\n"
-           L"  copy-file SOURCE NEW_FILE [--unbuffered]\n"
+           L"  copy-file SOURCE NEW_FILE [--unbuffered|--no-preallocation]\n"
            L"  storage-info PATH\n"
            L"  index X: | index-dir PATH\n"
            L"  driver-status | driver-load | driver-unload\n"
            L"  prepare PARENT COUNT flat|deep|mixed|fanout\n"
            L"  prepare-large PARENT MIB\n"
-           L"  bench-copy SOURCE NEW_FILE [--unbuffered]\n"
+           L"  bench-copy SOURCE NEW_FILE [--unbuffered|--no-preallocation]\n"
            L"  win32-size PATH | win32-find PATH NAME\n"
            L"  measure LABEL FILES cold|warm|as-created zero|robocopy EXE [ARGS ...]\n",
            stderr);
@@ -100,12 +100,20 @@ int wmain(int argc, wchar_t **argv)
                 result.files, result.directories, result.bytes, result.errors, result.workers);
     } else if (argc >= 4 && !wcscmp(verb, L"shell-delete") && !wcscmp(argv[2], L"--yes")) {
         error = (DWORD)shell_operation(L"delete", argc - 3, argv + 3, NULL, NULL, TRUE);
-    } else if ((argc == 4 || (argc == 5 && !wcscmp(argv[4], L"--unbuffered"))) &&
-               !wcscmp(verb, L"copy-file")) {
-        error = copy_file_mode(argv[2], argv[3], argc == 5);
-    } else if ((argc == 4 || (argc == 5 && !wcscmp(argv[4], L"--unbuffered"))) &&
-               !wcscmp(verb, L"bench-copy")) {
-        error = benchmark_copy(argv[2], argv[3], argc == 5);
+    } else if ((argc == 4 || argc == 5) && (!wcscmp(verb, L"copy-file") || !wcscmp(verb, L"bench-copy"))) {
+        STDIO_COPY_MODE mode = STDIO_COPY_BUFFERED;
+        if (argc == 5) {
+            if (!wcscmp(argv[4], L"--unbuffered"))
+                mode = STDIO_COPY_UNBUFFERED;
+            else if (!wcscmp(argv[4], L"--no-preallocation"))
+                mode = STDIO_COPY_NO_PREALLOCATION;
+            else
+                return help();
+        }
+        if (!wcscmp(verb, L"bench-copy"))
+            error = benchmark_copy(argv[2], argv[3], mode);
+        else
+            error = copy_file_mode(argv[2], argv[3], mode);
     } else if (argc == 3 && !wcscmp(verb, L"storage-info")) {
         error = storage_info(argv[2]);
     } else if (argc == 4 && !wcscmp(verb, L"move-new")) {
