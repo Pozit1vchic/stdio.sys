@@ -57,6 +57,7 @@ stdioctl move "D:\Archive" "D:\Data\Project"
 stdioctl move-new "D:\Archive\Project" "D:\Data\Project"
 stdioctl copy-file "D:\Data\source.txt" "D:\Backup\new.txt"
 stdioctl copy-file "D:\Data\archive.bin" "E:\archive.bin"
+stdioctl storage-info "D:\Data"
 stdioctl index-dir "D:\Data\Project"
 stdioctl index D:
 ```
@@ -69,6 +70,7 @@ stdioctl index D:
 - Встреча с reparse point, offline-объектом, сжатым или зашифрованным каталогом завершает `copy-new` с ошибкой. На NTFS новые объекты наследуют права назначения. Для каталогов с дополнительными потоками, ссылками или специальными метаданными используй `copy`. При ошибке уже завершённые файлы остаются в новом дереве.
 - Соседние ветви могут копироваться параллельно. Когда одна ветвь заканчивается, её поток может помогать с файлами в другой ветви. Один общий лимит действует на всю операцию. При единственной ветви потоки работают с независимыми файлами внутри неё.
 - По умолчанию Windows копирует с буферизацией. Для одного большого видео или архива `copy-file` передаёт файл целиком в `CopyFile2`. Пул движка используется для независимых файлов. Для сравнения на конкретном носителе `copy-file --unbuffered` включает режим без системного кэша, а `copy-new --unbuffered-large` включает его для обычных файлов от 512 МиБ. Проверенные локальные прогоны проводились на NVMe, проверка на физической флешке предстоит. [Параметры CopyFile2](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-copyfile2_extended_parameters)
+- `storage-info` показывает файловую систему, поддержку клонирования блоков томом и результат запроса аппаратного копирования ODX. Клонирование блоков применимо в пределах одного поддерживаемого тома. [Возможности файловой системы](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationw) · [Запрос возможностей ODX](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-device_copy_offload_descriptor)
 - `move-new` переименовывает объект в пределах тома одним вызовом Win32 с запретом замены существующего назначения. Межтомовое перемещение выполняет команда `move` через Windows Shell. [Семантика MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
 - При неподдерживаемом пути команда размера в Проводнике может открыть обычные свойства папки. Частично выполненное удаление требует явного повторного запуска с выбранной пользователем семантикой.
 

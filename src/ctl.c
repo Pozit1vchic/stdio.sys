@@ -37,6 +37,7 @@ static int help(void)
            L"  move DESTINATION SOURCE [SOURCE ...]\n"
            L"  move-new NEW_PATH SOURCE (same volume)\n"
            L"  copy-file SOURCE NEW_FILE [--unbuffered]\n"
+           L"  storage-info PATH\n"
            L"  index X: | index-dir PATH\n"
            L"  driver-status | driver-load | driver-unload\n"
            L"  prepare PARENT COUNT flat|deep|mixed|fanout\n"
@@ -101,6 +102,8 @@ int wmain(int argc, wchar_t **argv)
     } else if ((argc == 4 || (argc == 5 && !wcscmp(argv[4], L"--unbuffered"))) &&
                !wcscmp(verb, L"copy-file")) {
         error = copy_file_mode(argv[2], argv[3], argc == 5);
+    } else if (argc == 3 && !wcscmp(verb, L"storage-info")) {
+        error = storage_info(argv[2]);
     } else if (argc == 4 && !wcscmp(verb, L"move-new")) {
         error = MoveFileExW(argv[3], argv[2], 0) ? ERROR_SUCCESS : GetLastError();
     } else if (argc == 2 && !wcscmp(verb, L"driver-status")) {

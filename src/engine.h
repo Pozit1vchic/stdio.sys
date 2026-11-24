@@ -23,6 +23,7 @@ typedef DWORD (*TREE_VISITOR)(void *context, ULONGLONG parent, const FILE_ID_EXT
 DWORD tree_snapshot(const wchar_t *path, TREE_VISITOR visitor, void *context,
                     ULONGLONG *root_id, TREE_RESULT *result);
 DWORD storage_workers(const wchar_t *path);
+DWORD storage_info(const wchar_t *path);
 DWORD plain_copy(const wchar_t *source, const wchar_t *destination);
 DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, BOOL unbuffered);
 DWORD copy_new_tree(const wchar_t *source, const wchar_t *destination, DWORD workers,

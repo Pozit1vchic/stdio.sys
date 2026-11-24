@@ -347,6 +347,41 @@ DWORD storage_workers(const wchar_t *path)
     return workers;
 }
 
+DWORD storage_info(const wchar_t *path)
+{
+    wchar_t root[MAX_PATH], fs[32], device[] = L"\\\\.\\X:";
+    DWORD flags, bytes = 0;
+    STORAGE_PROPERTY_QUERY query = { StorageDeviceCopyOffloadProperty, PropertyStandardQuery, {0} };
+    DEVICE_COPY_OFFLOAD_DESCRIPTOR odx;
+    HANDLE volume;
+
+    if (!GetVolumePathNameW(path, root, ARRAYSIZE(root)) ||
+        !GetVolumeInformationW(root, NULL, 0, NULL, NULL, &flags, fs, ARRAYSIZE(fs)))
+        return GetLastError();
+    wprintf(L"filesystem=%ls block_clone=%u copy_workers=%lu\n", fs,
+            (unsigned)((flags & FILE_SUPPORTS_BLOCK_REFCOUNTING) != 0), storage_workers(path));
+    if (wcslen(root) != 3 || root[1] != L':' || !local_storage(root)) {
+        wprintf(L"odx_status=not_queried\n");
+        return ERROR_SUCCESS;
+    }
+    device[4] = root[0];
+    volume = CreateFileW(device, 0, SHARE_ALL, NULL, OPEN_EXISTING, 0, NULL);
+    if (volume == INVALID_HANDLE_VALUE) {
+        wprintf(L"odx_status=unavailable windows_error=%lu\n", GetLastError());
+        return ERROR_SUCCESS;
+    }
+    if (!DeviceIoControl(volume, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                         &odx, sizeof(odx), &bytes, NULL)) {
+        wprintf(L"odx_status=unavailable windows_error=%lu\n", GetLastError());
+    } else if (bytes < sizeof(odx) || odx.Size < sizeof(odx)) {
+        wprintf(L"odx_status=incomplete\n");
+    } else {
+        wprintf(L"odx_status=reported max_transfer_bytes=%llu\n", odx.MaximumTransferSize);
+    }
+    CloseHandle(volume);
+    return ERROR_SUCCESS;
+}
+
 static DWORD walk_path(const wchar_t *path, BOOL remove, DWORD workers, const wchar_t *needle,
                        TREE_VISITOR visitor, void *context, ULONGLONG *root_id,
                        TREE_RESULT *result, ULONGLONG *matches)

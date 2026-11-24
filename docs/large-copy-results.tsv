@@ -1,0 +1,5 @@
+mib	mode	copy_seconds	copy_and_flush_seconds	sha256_matches
+10240	buffered	18.230449	20.019136	true
+10240	unbuffered	35.011389	35.017015	true
+20480	buffered	76.126309	79.977593	true
+30720	buffered	99.415230	123.492282	true
