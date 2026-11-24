@@ -71,6 +71,7 @@ int wmain(int argc, wchar_t **argv)
 {
     wchar_t cwd[MAX_PATH], root[MAX_PATH], id[40], source[MAX_PATH], copy[MAX_PATH], stream[MAX_PATH];
     wchar_t relative[MAX_PATH], hardlink[MAX_PATH], tree_copy[MAX_PATH], nested[MAX_PATH];
+    wchar_t left[MAX_PATH], right[MAX_PATH], payload[MAX_PATH];
     TREE_RESULT result;
     GUID guid;
     HANDLE lock = INVALID_HANDLE_VALUE;
@@ -115,10 +116,22 @@ int wmain(int argc, wchar_t **argv)
     }
     CloseHandle(lock);
     lock = INVALID_HANDLE_VALUE;
+    swprintf_s(left, ARRAYSIZE(left), L"%ls\\left", root);
+    swprintf_s(right, ARRAYSIZE(right), L"%ls\\right", root);
+    if (!CreateDirectoryW(left, NULL) || !CreateDirectoryW(right, NULL))
+        goto cleanup;
+    swprintf_s(payload, ARRAYSIZE(payload), L"%ls\\payload.txt", left);
+    swprintf_s(stream, ARRAYSIZE(stream), L"%ls:meta", payload);
+    if (!make_file(payload, "left", 4) || !make_file(stream, "ads", 3))
+        goto cleanup;
+    swprintf_s(payload, ARRAYSIZE(payload), L"%ls\\payload.txt", right);
+    if (!make_file(payload, "right", 5))
+        goto cleanup;
     if (copy_new_tree(root, nested, 4, FALSE, &result) != ERROR_INVALID_PARAMETER ||
         GetFileAttributesW(nested) != INVALID_FILE_ATTRIBUTES ||
         copy_new_tree(root, tree_copy, 4, FALSE, &result) ||
-        tree_run(tree_copy, FALSE, 0, &result) || result.files != 3 || result.bytes != 24) {
+        tree_run(tree_copy, FALSE, 0, &result) ||
+        result.files != 5 || result.directories != 3 || result.bytes != 33) {
         fputws(L"Tree copy failed or accepted a destination inside its source.\n", stderr);
         goto cleanup;
     }
@@ -126,7 +139,7 @@ int wmain(int argc, wchar_t **argv)
         fputws(L"Tree copy accepted an existing destination.\n", stderr);
         goto cleanup;
     }
-    swprintf_s(stream, ARRAYSIZE(stream), L"%ls\\тест.txt:meta", tree_copy);
+    swprintf_s(stream, ARRAYSIZE(stream), L"%ls\\left\\payload.txt:meta", tree_copy);
     lock = CreateFileW(stream, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (lock == INVALID_HANDLE_VALUE || GetFileSize(lock, NULL) != 3) {
         fputws(L"Tree copy lost the alternate data stream.\n", stderr);

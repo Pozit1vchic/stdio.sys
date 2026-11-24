@@ -555,6 +555,9 @@ DWORD plain_copy(const wchar_t *source, const wchar_t *destination)
 typedef struct {
     TREE_RESULT *result;
     PTP_WORK work;
+    PTP_CALLBACK_ENVIRON branch_environment;
+    PTP_CALLBACK_ENVIRON helper_environment;
+    volatile LONG *helper_slots;
     HANDLE source;
     const wchar_t *source_path;
     const wchar_t *target_path;
@@ -688,19 +691,47 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
     }
 }
 
+static unsigned reserve_copy_helpers(volatile LONG *slots, unsigned limit)
+{
+    LONG available = InterlockedCompareExchange(slots, 0, 0);
+    while (available > 0) {
+        LONG take = min(available, (LONG)limit);
+        LONG observed = InterlockedCompareExchange(slots, available - take, available);
+        if (observed == available)
+            return (unsigned)take;
+        available = observed;
+    }
+    return 0;
+}
+
 static void copy_flush(COPY_BATCH *batch)
 {
-    unsigned i;
+    unsigned i, helpers = 0;
     if (!batch->count)
         return;
     batch->next = -1;
-    if (batch->work && batch->count >= 4) {
-        for (i = 1; i < batch->result->workers && i < batch->count; ++i)
-            SubmitThreadpoolWork(batch->work);
+    if (batch->count >= 4) {
+        if (batch->helper_slots) {
+            helpers = reserve_copy_helpers(batch->helper_slots, batch->count - 1);
+            if (helpers && !batch->work) {
+                batch->work = CreateThreadpoolWork(copy_worker, batch, batch->helper_environment);
+                if (!batch->work) {
+                    InterlockedExchangeAdd(batch->helper_slots, (LONG)helpers);
+                    helpers = 0;
+                }
+            }
+        } else if (batch->work) {
+            helpers = min(batch->result->workers - 1, batch->count - 1);
+        }
     }
+    for (i = 0; i < helpers; ++i)
+        SubmitThreadpoolWork(batch->work);
     copy_worker(NULL, batch, NULL);
-    if (batch->work && batch->count >= 4)
+    if (helpers) {
         WaitForThreadpoolWorkCallbacks(batch->work, FALSE);
+        if (batch->helper_slots)
+            InterlockedExchangeAdd(batch->helper_slots, (LONG)helpers);
+    }
     for (i = 0; i < batch->count; ++i) {
         if (!batch->errors[i]) {
             ++batch->result->files;
@@ -730,6 +761,166 @@ static DWORD directory_path(HANDLE handle, wchar_t *path, DWORD capacity, size_t
     path[count] = 0;
     *length = count;
     return ERROR_SUCCESS;
+}
+
+static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
+                            wchar_t *source_path, size_t source_length,
+                            wchar_t *target_path, size_t target_length);
+
+typedef struct {
+    const FILE_ID_EXTD_DIR_INFO *entry;
+    TREE_RESULT result;
+} COPY_BRANCH;
+
+typedef struct {
+    COPY_BATCH *parent;
+    HANDLE source, target;
+    unsigned child_depth;
+    wchar_t *source_path, *target_path;
+    size_t source_length, target_length;
+    COPY_BRANCH *jobs;
+    unsigned count;
+    volatile LONG next;
+    volatile LONG helper_slots;
+} COPY_BRANCH_BATCH;
+
+static DWORD copy_child(COPY_BATCH *batch, const COPY_BRANCH_BATCH *branches,
+                        const FILE_ID_EXTD_DIR_INFO *entry, wchar_t *source_path, wchar_t *target_path)
+{
+    HANDLE source_child, target_child;
+    size_t units = entry->FileNameLength / sizeof(wchar_t);
+    size_t source_end = branches->source_length + units;
+    size_t target_end = branches->target_length + units;
+    DWORD error;
+
+    if (source_end + 1 >= 32768 || target_end + 1 >= 32768)
+        return ERROR_FILENAME_EXCED_RANGE;
+    error = open_copy_entry(batch, branches->source, entry, FILE_LIST_DIRECTORY, &source_child);
+    if (error)
+        return error;
+    error = create_child_directory(branches->target, entry->FileName, (USHORT)entry->FileNameLength,
+                                   &target_child);
+    if (!error) {
+        memcpy(source_path + branches->source_length, entry->FileName, entry->FileNameLength);
+        source_path[source_end] = L'\\';
+        memcpy(target_path + branches->target_length, entry->FileName, entry->FileNameLength);
+        target_path[target_end] = L'\\';
+        error = copy_directory(batch, source_child, target_child, branches->child_depth,
+                               source_path, source_end + 1, target_path, target_end + 1);
+        CloseHandle(target_child);
+    }
+    CloseHandle(source_child);
+    return error;
+}
+
+static VOID CALLBACK copy_branch_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WORK work)
+{
+    COPY_BRANCH_BATCH *branches = context;
+    COPY_BATCH serial = *branches->parent;
+    wchar_t source_path[32768], target_path[32768];
+    LONG index;
+    UNREFERENCED_PARAMETER(instance);
+    UNREFERENCED_PARAMETER(work);
+
+    /* Branches share the budget but each worker owns its paths and file batches. */
+    serial.work = NULL;
+    serial.branch_environment = NULL;
+    serial.helper_environment = branches->parent->branch_environment;
+    serial.helper_slots = &branches->helper_slots;
+    serial.source_path = source_path;
+    serial.target_path = target_path;
+    memcpy(source_path, branches->source_path, branches->source_length * sizeof(*source_path));
+    memcpy(target_path, branches->target_path, branches->target_length * sizeof(*target_path));
+    while ((index = InterlockedIncrement(&branches->next)) < (LONG)branches->count) {
+        COPY_BRANCH *job = &branches->jobs[index];
+        serial.result = &job->result;
+        serial.count = 0;
+        job->result.workers = 1;
+        record_error(&job->result, copy_child(&serial, branches, job->entry, source_path, target_path));
+    }
+    if (serial.work)
+        CloseThreadpoolWork(serial.work);
+    InterlockedIncrement(&branches->helper_slots);
+}
+
+static DWORD copy_branch_flush(COPY_BRANCH_BATCH *branches)
+{
+    COPY_BATCH *batch = branches->parent;
+    TREE_RESULT *result = batch->result;
+    PTP_WORK work = NULL;
+    unsigned i;
+    DWORD error = ERROR_SUCCESS;
+
+    if (branches->count > 1 && batch->branch_environment)
+        work = CreateThreadpoolWork(copy_branch_worker, branches, batch->branch_environment);
+    if (work) {
+        unsigned active = min(result->workers, branches->count);
+        branches->next = -1;
+        branches->helper_slots = (LONG)(result->workers - active);
+        for (i = 1; i < active; ++i)
+            SubmitThreadpoolWork(work);
+        copy_branch_worker(NULL, branches, NULL);
+        WaitForThreadpoolWorkCallbacks(work, FALSE);
+        CloseThreadpoolWork(work);
+        for (i = 0; i < branches->count; ++i) {
+            const TREE_RESULT *job = &branches->jobs[i].result;
+            result->files += job->files;
+            result->bytes += job->bytes;
+            result->directories += job->directories;
+            result->errors += job->errors;
+            if (!result->error)
+                result->error = job->error;
+        }
+    } else {
+        for (i = 0; i < branches->count && !error && !result->error; ++i)
+            error = copy_child(batch, branches, branches->jobs[i].entry,
+                               branches->source_path, branches->target_path);
+    }
+    branches->count = 0;
+    return error;
+}
+
+static DWORD copy_parallel_children(COPY_BRANCH_BATCH *branches, FILE_ID_EXTD_DIR_INFO *entry)
+{
+    COPY_BRANCH jobs[2 * MAX_WORKERS];
+    DWORD error = ERROR_SUCCESS;
+    branches->jobs = jobs;
+    for (; entry && !error && !branches->parent->result->error; entry = next_entry(entry)) {
+        if (dot_entry(entry) || !ordinary_directory(entry))
+            continue;
+        jobs[branches->count++] = (COPY_BRANCH){ .entry = entry };
+        if (branches->count == ARRAYSIZE(jobs))
+            error = copy_branch_flush(branches);
+    }
+    return error ? error : copy_branch_flush(branches);
+}
+
+static DWORD copy_child_entries(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
+                                wchar_t *source_path, size_t source_length,
+                                wchar_t *target_path, size_t target_length, FILE_ID_EXTD_DIR_INFO *entry)
+{
+    COPY_BRANCH_BATCH branches = {
+        .parent = batch, .source = source, .target = target, .child_depth = depth + 1,
+        .source_path = source_path, .target_path = target_path,
+        .source_length = source_length, .target_length = target_length
+    };
+    DWORD error = ERROR_SUCCESS;
+    if (batch->branch_environment) {
+        FILE_ID_EXTD_DIR_INFO *first = NULL;
+        for (; entry; entry = next_entry(entry)) {
+            if (!dot_entry(entry) && ordinary_directory(entry)) {
+                if (first)
+                    return copy_parallel_children(&branches, first);
+                first = entry;
+            }
+        }
+        return first ? copy_child(batch, &branches, first, source_path, target_path) : ERROR_SUCCESS;
+    }
+    for (; entry && !error && !batch->result->error; entry = next_entry(entry)) {
+        if (!dot_entry(entry) && ordinary_directory(entry))
+            error = copy_child(batch, &branches, entry, source_path, target_path);
+    }
+    return error;
 }
 
 static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
@@ -778,33 +969,8 @@ static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, uns
         copy_flush(batch);
         if (error || batch->result->error)
             break;
-        for (entry = (void *)buffer; entry; entry = next_entry(entry)) {
-            HANDLE source_child, target_child;
-            size_t units;
-            if (dot_entry(entry) || !ordinary_directory(entry))
-                continue;
-            units = entry->FileNameLength / sizeof(wchar_t);
-            if (source_length + units + 1 >= 32768 || target_length + units + 1 >= 32768) {
-                error = ERROR_FILENAME_EXCED_RANGE;
-                break;
-            }
-            error = open_copy_entry(batch, source, entry, FILE_LIST_DIRECTORY, &source_child);
-            if (error)
-                break;
-            error = create_child_directory(target, entry->FileName, (USHORT)entry->FileNameLength, &target_child);
-            if (!error) {
-                memcpy(source_path + source_length, entry->FileName, entry->FileNameLength);
-                source_path[source_length + units] = L'\\';
-                memcpy(target_path + target_length, entry->FileName, entry->FileNameLength);
-                target_path[target_length + units] = L'\\';
-                error = copy_directory(batch, source_child, target_child, depth + 1, source_path,
-                                       source_length + units + 1, target_path, target_length + units + 1);
-                CloseHandle(target_child);
-            }
-            CloseHandle(source_child);
-            if (error || batch->result->error)
-                break;
-        }
+        error = copy_child_entries(batch, source, target, depth, source_path, source_length, target_path,
+                                   target_length, (void *)buffer);
         if (error)
             break;
     }
@@ -916,12 +1082,14 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
     if (result->workers > 1) {
         pool = CreateThreadpool(NULL);
         if (pool) {
-            SetThreadpoolThreadMaximum(pool, result->workers - 1);
+            SetThreadpoolThreadMaximum(pool, result->workers);
             InitializeThreadpoolEnvironment(&environment);
             SetThreadpoolCallbackPool(&environment, pool);
             batch.work = CreateThreadpoolWork(copy_worker, &batch, &environment);
         }
-        if (!batch.work)
+        if (batch.work)
+            batch.branch_environment = &environment;
+        else
             result->workers = 1;
     }
     error = copy_directory(&batch, source, target, 0, source_path, source_length, target_path, target_length);

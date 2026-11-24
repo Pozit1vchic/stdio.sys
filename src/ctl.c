@@ -39,7 +39,7 @@ static int help(void)
            L"  copy-file SOURCE NEW_FILE [--unbuffered]\n"
            L"  index X: | index-dir PATH\n"
            L"  driver-status | driver-load | driver-unload\n"
-           L"  prepare PARENT COUNT flat|deep|mixed\n"
+           L"  prepare PARENT COUNT flat|deep|mixed|fanout\n"
            L"  prepare-large PARENT MIB\n"
            L"  win32-size PATH | win32-find PATH NAME\n"
            L"  measure LABEL FILES cold|warm|as-created zero|robocopy EXE [ARGS ...]\n",

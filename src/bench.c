@@ -44,7 +44,7 @@ static DWORD make_file(const wchar_t *path, const BYTE *buffer, DWORD capacity,
 static DWORD prepare(const wchar_t *parent, ULONGLONG count, const wchar_t *layout,
                      ULONGLONG large_bytes)
 {
-    enum { DATA_SIZE = 1024 * 1024, SHARDS = 64, DEPTH = 192 };
+    enum { DATA_SIZE = 1024 * 1024, SHARDS = 64, MANY_SHARDS = 4096, DEPTH = 192 };
     static const DWORD small_sizes[] = {0, 64, 512, 1024, 4096, 8192};
     wchar_t parent_path[MAX_PATH], root[MAX_PATH], directory[MAX_PATH + DEPTH + 16];
     wchar_t file[MAX_PATH + DEPTH + 64], id[40];
@@ -52,7 +52,9 @@ static DWORD prepare(const wchar_t *parent, ULONGLONG count, const wchar_t *layo
     GUID guid;
     BYTE *data;
     DWORD seed = 0x19274123, error = ERROR_SUCCESS, length;
-    BOOL deep = !wcscmp(layout, L"deep"), mixed = !wcscmp(layout, L"mixed");
+    BOOL deep = !wcscmp(layout, L"deep"), fanout = !wcscmp(layout, L"fanout");
+    BOOL mixed = fanout || !wcscmp(layout, L"mixed");
+    size_t shards = fanout ? MANY_SHARDS : SHARDS;
     HRESULT hr;
     if (!count || count > 1000000 || (!large_bytes && !deep && !mixed && wcscmp(layout, L"flat")))
         return ERROR_INVALID_PARAMETER;
@@ -61,6 +63,13 @@ static DWORD prepare(const wchar_t *parent, ULONGLONG count, const wchar_t *layo
         return GetLastError();
     if (length >= ARRAYSIZE(parent_path) || length < 3 || parent_path[1] != L':')
         return ERROR_INVALID_NAME;
+    if (large_bytes) {
+        ULARGE_INTEGER available;
+        if (!GetDiskFreeSpaceExW(parent_path, &available, NULL, NULL))
+            return GetLastError();
+        if (available.QuadPart < large_bytes)
+            return ERROR_DISK_FULL;
+    }
     hr = CoCreateGuid(&guid);
     if (FAILED(hr))
         return (DWORD)hr;
@@ -91,7 +100,7 @@ static DWORD prepare(const wchar_t *parent, ULONGLONG count, const wchar_t *layo
                 break;
             }
             ++created_dirs;
-        } else if (mixed && i % ((count + SHARDS - 1) / SHARDS) == 0) {
+        } else if (mixed && i % ((count + shards - 1) / shards) == 0) {
             swprintf_s(directory, ARRAYSIZE(directory), L"\\\\?\\%ls\\part-%03zu", root, created_dirs);
             if (!CreateDirectoryW(directory, NULL)) {
                 error = GetLastError();
@@ -119,7 +128,7 @@ DWORD benchmark_prepare(const wchar_t *parent, ULONGLONG count, const wchar_t *l
 
 DWORD benchmark_prepare_large(const wchar_t *parent, ULONGLONG mib)
 {
-    if (!mib || mib > 16384)
+    if (!mib || mib > 32768)
         return ERROR_INVALID_PARAMETER;
     return prepare(parent, 1, L"large", mib * 1024 * 1024);
 }
