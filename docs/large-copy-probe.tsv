@@ -1,0 +1,5 @@
+variant	copy_seconds	copy_and_flush_seconds	sha256_matches
+sequential-write	NA	28.715100	NA
+CopyFile2	17.052761	20.486225	true
+IOCP-buffered-4	13.200059	22.744878	true
+IOCP-direct-8	22.316740	22.332373	true
