@@ -22,7 +22,7 @@ add_library(stdio_extension SHARED src/explorer.c src/explorer.def)
 set_target_properties(stdio_extension PROPERTIES OUTPUT_NAME stdio ARCHIVE_OUTPUT_NAME stdio_extension)
 target_link_libraries(stdio_extension PRIVATE shell32 shlwapi ole32 uuid advapi32)
 add_executable(stdioctl src/ctl.c src/bench.c)
-target_link_libraries(stdioctl PRIVATE engine fltlib psapi)
+target_link_libraries(stdioctl PRIVATE engine fltlib psapi bcrypt)
 install(TARGETS stdio stdio_extension stdioctl RUNTIME DESTINATION . LIBRARY DESTINATION .)
 
 include(CTest)

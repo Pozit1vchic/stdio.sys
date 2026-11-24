@@ -1,6 +1,8 @@
 #include "bench.h"
+#include <bcrypt.h>
 #include <objbase.h>
 #include <psapi.h>
+#include <winternl.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -131,6 +133,110 @@ DWORD benchmark_prepare_large(const wchar_t *parent, ULONGLONG mib)
     if (!mib || mib > 32768)
         return ERROR_INVALID_PARAMETER;
     return prepare(parent, 1, L"large", mib * 1024 * 1024);
+}
+
+#define HASH_BUFFER (1024 * 1024)
+#define SHA256_BYTES 32
+
+static DWORD hash_file(HANDLE file, BYTE *buffer, BYTE digest[SHA256_BYTES])
+{
+    BCRYPT_HASH_HANDLE hash;
+    NTSTATUS status = BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &hash, NULL, 0, NULL, 0, 0);
+    DWORD error = ERROR_SUCCESS;
+    if (status < 0)
+        return RtlNtStatusToDosError(status);
+    for (;;) {
+        DWORD bytes;
+        if (!ReadFile(file, buffer, HASH_BUFFER, &bytes, NULL)) {
+            error = GetLastError();
+            break;
+        }
+        if (!bytes) {
+            status = BCryptFinishHash(hash, digest, SHA256_BYTES, 0);
+            break;
+        }
+        status = BCryptHashData(hash, buffer, bytes, 0);
+        if (status < 0)
+            break;
+    }
+    BCryptDestroyHash(hash);
+    return error ? error : status < 0 ? RtlNtStatusToDosError(status) : ERROR_SUCCESS;
+}
+
+DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, BOOL unbuffered)
+{
+    HANDLE input, output = INVALID_HANDLE_VALUE;
+    FILE_ATTRIBUTE_TAG_INFO attributes;
+    BYTE *buffer = NULL;
+    BYTE expected[SHA256_BYTES], actual[SHA256_BYTES];
+    LARGE_INTEGER length, copied_length, frequency, start, copied, flushed;
+    DWORD error;
+    unsigned i;
+
+    input = CreateFileW(source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                       FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (input == INVALID_HANDLE_VALUE)
+        return GetLastError();
+    if (!GetFileInformationByHandleEx(input, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
+        !GetFileSizeEx(input, &length)) {
+        error = GetLastError();
+        goto done;
+    }
+    if (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
+                                     FILE_ATTRIBUTE_READONLY)) {
+        error = ERROR_NOT_SUPPORTED;
+        goto done;
+    }
+    buffer = malloc(HASH_BUFFER);
+    if (!buffer) {
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
+    }
+    error = hash_file(input, buffer, expected);
+    if (error)
+        goto done;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    error = copy_file_mode(source, destination, unbuffered);
+    QueryPerformanceCounter(&copied);
+    if (error)
+        goto done;
+    output = CreateFileW(destination, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (output == INVALID_HANDLE_VALUE || !FlushFileBuffers(output)) {
+        error = GetLastError();
+        goto done;
+    }
+    QueryPerformanceCounter(&flushed);
+    if (!GetFileSizeEx(output, &copied_length)) {
+        error = GetLastError();
+        goto done;
+    }
+    if (length.QuadPart != copied_length.QuadPart) {
+        error = ERROR_CRC;
+        goto done;
+    }
+    error = hash_file(output, buffer, actual);
+    if (error)
+        goto done;
+    if (memcmp(expected, actual, sizeof(expected))) {
+        error = ERROR_CRC;
+        goto done;
+    }
+    wprintf(L"bytes=%llu mode=%ls copy_seconds=%.6f copy_and_flush_seconds=%.6f sha256=",
+            (ULONGLONG)length.QuadPart, unbuffered ? L"unbuffered" : L"buffered",
+            (double)(copied.QuadPart - start.QuadPart) / (double)frequency.QuadPart,
+            (double)(flushed.QuadPart - start.QuadPart) / (double)frequency.QuadPart);
+    for (i = 0; i < SHA256_BYTES; ++i)
+        wprintf(L"%02x", (unsigned)actual[i]);
+    wprintf(L"\n");
+
+done:
+    if (output != INVALID_HANDLE_VALUE)
+        CloseHandle(output);
+    CloseHandle(input);
+    free(buffer);
+    return error;
 }
 
 static DWORD baseline_walk(wchar_t *path, size_t length, unsigned depth, TREE_RESULT *result,

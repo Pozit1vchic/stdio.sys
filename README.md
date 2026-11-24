@@ -57,6 +57,7 @@ stdioctl move "D:\Archive" "D:\Data\Project"
 stdioctl move-new "D:\Archive\Project" "D:\Data\Project"
 stdioctl copy-file "D:\Data\source.txt" "D:\Backup\new.txt"
 stdioctl copy-file "D:\Data\archive.bin" "E:\archive.bin"
+stdioctl bench-copy "D:\Data\archive.bin" "E:\archive-benchmark.bin"
 stdioctl storage-info "D:\Data"
 stdioctl index-dir "D:\Data\Project"
 stdioctl index D:
@@ -123,5 +124,7 @@ pnputil /delete-driver oemNN.inf /uninstall
 Сверь опубликованное имя `oemNN.inf` с исходным именем `stdio.inf` и поставщиком `stdio.sys`. Для повторных прогонов проверь перезапуск, выгрузку с открытым диагностическим соединением, ручное присоединение к NTFS и отказ для других файловых систем. Driver Verifier включается для `stdio.sys` только в VM, с отдельным прогоном проверки Code Integrity. [Примитивные драйверы Windows](https://learn.microsoft.com/en-us/windows-hardware/drivers/develop/creating-a-primitive-driver) · [PnPUtil](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax)
 
 ## Производительность
+
+`bench-copy` измеряет обычное копирование одного файла до возврата операции и до завершения сброса буферов Windows. Команда сверяет длину и SHA‑256 основного потока данных. Файл назначения должен быть новым. Режим без буферизации включается аргументом `--unbuffered`.
 
 [Методика и результаты](docs/benchmarks.md)

@@ -42,6 +42,7 @@ static int help(void)
            L"  driver-status | driver-load | driver-unload\n"
            L"  prepare PARENT COUNT flat|deep|mixed|fanout\n"
            L"  prepare-large PARENT MIB\n"
+           L"  bench-copy SOURCE NEW_FILE [--unbuffered]\n"
            L"  win32-size PATH | win32-find PATH NAME\n"
            L"  measure LABEL FILES cold|warm|as-created zero|robocopy EXE [ARGS ...]\n",
            stderr);
@@ -102,6 +103,9 @@ int wmain(int argc, wchar_t **argv)
     } else if ((argc == 4 || (argc == 5 && !wcscmp(argv[4], L"--unbuffered"))) &&
                !wcscmp(verb, L"copy-file")) {
         error = copy_file_mode(argv[2], argv[3], argc == 5);
+    } else if ((argc == 4 || (argc == 5 && !wcscmp(argv[4], L"--unbuffered"))) &&
+               !wcscmp(verb, L"bench-copy")) {
+        error = benchmark_copy(argv[2], argv[3], argc == 5);
     } else if (argc == 3 && !wcscmp(verb, L"storage-info")) {
         error = storage_info(argv[2]);
     } else if (argc == 4 && !wcscmp(verb, L"move-new")) {
