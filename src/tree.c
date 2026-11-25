@@ -127,7 +127,7 @@ static DWORD remove_open(HANDLE handle)
 }
 
 static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCESS_MASK access,
-                        ULONG sharing, BOOL use_native_stat, HANDLE *handle)
+                        ULONG sharing, BOOL use_native_stat, HANDLE *handle, ULONGLONG *size)
 {
     FILE_ID_INFO id;
     FILE_ATTRIBUTE_TAG_INFO tag;
@@ -143,12 +143,20 @@ static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCES
         if (memcmp(&stat_id, &entry->FileId, sizeof(stat_id)) ||
             ((stat.attributes ^ entry->FileAttributes) & mask))
             error = ERROR_RETRY;
+        else if (size)
+            *size = (ULONGLONG)stat.end_of_file.QuadPart;
     } else if (!GetFileInformationByHandleEx(*handle, FileIdInfo, &id, sizeof(id)) ||
         !GetFileInformationByHandleEx(*handle, FileAttributeTagInfo, &tag, sizeof(tag))) {
         error = GetLastError();
     } else if (memcmp(&id.FileId, &entry->FileId, sizeof(id.FileId)) ||
                ((tag.FileAttributes ^ entry->FileAttributes) & mask)) {
         error = ERROR_RETRY;
+    } else if (size) {
+        LARGE_INTEGER length;
+        if (GetFileSizeEx(*handle, &length))
+            *size = (ULONGLONG)length.QuadPart;
+        else
+            error = GetLastError();
     }
     if (error)
         CloseHandle(*handle);
@@ -158,7 +166,7 @@ static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCES
 static void delete_job(DELETE_JOB *job)
 {
     HANDLE file;
-    job->error = open_entry(job->parent, job->entry, DELETE, SHARE_READ_ONLY, TRUE, &file);
+    job->error = open_entry(job->parent, job->entry, DELETE, SHARE_READ_ONLY, TRUE, &file, NULL);
     if (!job->error) {
         job->error = remove_open(file);
         CloseHandle(file);
@@ -286,7 +294,7 @@ static void walk_directory(WALK *walk, HANDLE directory, unsigned depth, ULONGLO
             if (dot_entry(entry) || !ordinary_directory(entry))
                 continue;
             error = open_entry(directory, entry, FILE_LIST_DIRECTORY | (walk->remove ? DELETE : 0),
-                               walk->remove ? SHARE_READ_ONLY : SHARE_ALL, TRUE, &child);
+                               walk->remove ? SHARE_READ_ONLY : SHARE_ALL, TRUE, &child, NULL);
             if (!error) {
                 walk_directory(walk, child, depth + 1, ntfs_id(&entry->FileId));
                 CloseHandle(child);
@@ -569,8 +577,15 @@ DWORD tree_list(const wchar_t *path)
     return error;
 }
 
+static COPYFILE2_MESSAGE_ACTION CALLBACK copy_cancel_progress(const COPYFILE2_MESSAGE *message, PVOID context)
+{
+    UNREFERENCED_PARAMETER(message);
+    return WaitForSingleObject(context, 0) == WAIT_OBJECT_0 ?
+           COPYFILE2_PROGRESS_CANCEL : COPYFILE2_PROGRESS_CONTINUE;
+}
+
 static DWORD copy_file_with_flags(const wchar_t *source, const wchar_t *destination,
-                                 STDIO_COPY_MODE mode, DWORD flags)
+                                 STDIO_COPY_MODE mode, DWORD flags, HANDLE cancel_event)
 {
     COPYFILE2_EXTENDED_PARAMETERS options = {
         sizeof(options), COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK | flags, NULL, NULL, NULL
@@ -580,6 +595,10 @@ static DWORD copy_file_with_flags(const wchar_t *source, const wchar_t *destinat
         options.dwCopyFlags |= COPY_FILE_NO_BUFFERING;
     else if (mode == STDIO_COPY_NO_PREALLOCATION)
         options.dwCopyFlags |= COPY_FILE_DISABLE_PRE_ALLOCATION;
+    if (cancel_event) {
+        options.pProgressRoutine = copy_cancel_progress;
+        options.pvCallbackContext = cancel_event;
+    }
     result = CopyFile2(source, destination, &options);
     return FAILED(result) ? (HRESULT_FACILITY(result) == FACILITY_WIN32 ?
                             HRESULT_CODE(result) : (DWORD)result) : ERROR_SUCCESS;
@@ -598,7 +617,7 @@ DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_CO
             (capabilities & FILE_SUPPORTS_SPARSE_FILES))
             flags = COPY_FILE_ENABLE_SPARSE_COPY;
     }
-    return copy_file_with_flags(source, destination, mode, flags);
+    return copy_file_with_flags(source, destination, mode, flags, NULL);
 }
 
 DWORD plain_copy(const wchar_t *source, const wchar_t *destination)
@@ -607,7 +626,22 @@ DWORD plain_copy(const wchar_t *source, const wchar_t *destination)
 }
 
 typedef struct {
-    TREE_RESULT *result;
+    const TREE_COPY_OPTIONS *options;
+    SRWLOCK report_lock;
+    SRWLOCK totals_lock;
+    volatile LONG stop_error;
+} COPY_OPERATION;
+
+typedef struct {
+    DWORD error;
+    TREE_COPY_STATE state;
+    TREE_COPY_EFFECT effect;
+    ULONGLONG bytes;
+} COPY_OUTCOME;
+
+typedef struct {
+    TREE_COPY_RESULT *summary;
+    COPY_OPERATION *operation;
     PTP_WORK work;
     PTP_CALLBACK_ENVIRON branch_environment;
     PTP_CALLBACK_ENVIRON helper_environment;
@@ -625,20 +659,49 @@ typedef struct {
     BOOL fat32;
     BOOL unbuffered_large;
     const FILE_ID_EXTD_DIR_INFO *entries[COPY_ROOT_BATCH_SIZE];
-    DWORD errors[COPY_ROOT_BATCH_SIZE];
     unsigned count;
     volatile LONG next;
 } COPY_BATCH;
 
+static void copy_stop(COPY_OPERATION *operation, DWORD error)
+{
+    if (error)
+        InterlockedCompareExchange(&operation->stop_error, (LONG)error, 0);
+}
+
+static DWORD copy_stopped(COPY_OPERATION *operation)
+{
+    if (operation->options && operation->options->cancel_event &&
+        WaitForSingleObject(operation->options->cancel_event, 0) == WAIT_OBJECT_0)
+        copy_stop(operation, ERROR_CANCELLED);
+    return (DWORD)ReadAcquire(&operation->stop_error);
+}
+
+static TREE_COPY_STATE copy_skipped_state(DWORD error)
+{
+    return error == ERROR_CANCELLED ? TREE_COPY_CANCELLED : TREE_COPY_SKIPPED;
+}
+
+static void copy_report(COPY_OPERATION *operation, const wchar_t *source, const wchar_t *destination,
+                        const FILE_ID_128 *id, BOOL directory, COPY_OUTCOME outcome)
+{
+    if (operation->options && operation->options->report) {
+        TREE_COPY_ITEM item = {source, destination, id, directory, outcome.state, outcome.effect, outcome.error};
+        AcquireSRWLockExclusive(&operation->report_lock);
+        operation->options->report(operation->options->context, &item);
+        ReleaseSRWLockExclusive(&operation->report_lock);
+    }
+}
+
 static DWORD open_copy_entry(const COPY_BATCH *batch, HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry,
-                             ACCESS_MASK access, HANDLE *handle)
+                             ACCESS_MASK access, HANDLE *handle, ULONGLONG *size)
 {
     BY_HANDLE_FILE_INFORMATION info;
     DWORD error;
     DWORDLONG expected = ntfs_id(&entry->FileId);
     const DWORD type_mask = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
     if (!batch->legacy_source)
-        return open_entry(parent, entry, access, SHARE_READ_ONLY, !batch->refs_source, handle);
+        return open_entry(parent, entry, access, SHARE_READ_ONLY, !batch->refs_source, handle, size);
     if (!expected)
         return ERROR_NOT_SUPPORTED;
     error = native_open(parent, entry->FileName, (USHORT)entry->FileNameLength,
@@ -650,6 +713,8 @@ static DWORD open_copy_entry(const COPY_BATCH *batch, HANDLE parent, const FILE_
     else if (expected != (((DWORDLONG)info.nFileIndexHigh << 32) | info.nFileIndexLow) ||
              ((info.dwFileAttributes ^ entry->FileAttributes) & type_mask))
         error = ERROR_RETRY;
+    else if (size)
+        *size = ((ULONGLONG)info.nFileSizeHigh << 32) | info.nFileSizeLow;
     if (error)
         CloseHandle(*handle);
     return error;
@@ -683,15 +748,10 @@ static BOOL enumerate_copy_directory(const COPY_BATCH *batch, HANDLE directory, 
 }
 
 static DWORD portable_file_check(const COPY_BATCH *batch, const FILE_ID_EXTD_DIR_INFO *entry,
-                                 HANDLE pinned)
+                                 HANDLE pinned, ULONGLONG size)
 {
-    if (batch->fat32) {
-        LARGE_INTEGER size;
-        if (!GetFileSizeEx(pinned, &size))
-            return GetLastError();
-        if ((ULONGLONG)size.QuadPart > MAXDWORD)
-            return ERROR_FILE_TOO_LARGE;
-    }
+    if (batch->fat32 && size > MAXDWORD)
+        return ERROR_FILE_TOO_LARGE;
     if (!(batch->target_flags & FILE_SUPPORTS_EXTENDED_ATTRIBUTES) && entry->EaSize)
         return ERROR_EAS_NOT_SUPPORTED;
     if ((batch->source_flags & FILE_NAMED_STREAMS) && !(batch->target_flags & FILE_NAMED_STREAMS)) {
@@ -710,9 +770,81 @@ static DWORD portable_file_check(const COPY_BATCH *batch, const FILE_ID_EXTD_DIR
     return ERROR_SUCCESS;
 }
 
+static void count_copy_outcome(TREE_COPY_RESULT *summary, COPY_OUTCOME outcome)
+{
+    if (outcome.effect == TREE_COPY_DIRECTORY_CREATED)
+        ++summary->directories_created;
+    else if (outcome.effect == TREE_COPY_FILE_OUTCOME_UNKNOWN)
+        ++summary->files_outcome_unknown;
+    else if (outcome.effect == TREE_COPY_FILE_COPIED) {
+        ++summary->totals.files;
+        summary->totals.bytes += outcome.bytes;
+    }
+    if (outcome.state == TREE_COPY_FAILED)
+        record_error(&summary->totals, outcome.error);
+    else if (outcome.state == TREE_COPY_SKIPPED)
+        ++summary->skipped;
+    else if (outcome.state == TREE_COPY_CANCELLED)
+        ++summary->cancelled;
+}
+
+static void merge_copy_totals(TREE_COPY_RESULT *total, const TREE_COPY_RESULT *worker)
+{
+    total->totals.files += worker->totals.files;
+    total->totals.bytes += worker->totals.bytes;
+    total->totals.directories += worker->totals.directories;
+    total->totals.errors += worker->totals.errors;
+    total->directories_created += worker->directories_created;
+    total->files_outcome_unknown += worker->files_outcome_unknown;
+    total->skipped += worker->skipped;
+    total->cancelled += worker->cancelled;
+}
+
+static COPY_OUTCOME copy_regular_file(const COPY_BATCH *batch, const FILE_ID_EXTD_DIR_INFO *entry,
+                                      const wchar_t *source, const wchar_t *target)
+{
+    HANDLE pinned;
+    COPY_OUTCOME outcome = { .state = TREE_COPY_FAILED };
+    if (entry->FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)) {
+        outcome.error = ERROR_NOT_SUPPORTED;
+        return outcome;
+    }
+    outcome.error = open_copy_entry(batch, batch->source, entry, FILE_READ_DATA, &pinned, &outcome.bytes);
+    if (!outcome.error) {
+        outcome.error = portable_file_check(batch, entry, pinned, outcome.bytes);
+        if (!outcome.error && (outcome.error = copy_stopped(batch->operation)) != ERROR_SUCCESS) {
+            outcome.state = copy_skipped_state(outcome.error);
+        } else if (!outcome.error) {
+            DWORD flags = (entry->FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) &&
+                          (batch->target_flags & FILE_SUPPORTS_SPARSE_FILES) ?
+                          COPY_FILE_ENABLE_SPARSE_COPY : 0;
+            BOOL unbuffered = batch->unbuffered_large &&
+                              outcome.bytes >= LARGE_COPY_BYTES &&
+                              !(entry->FileAttributes & (FILE_ATTRIBUTE_COMPRESSED |
+                                FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_SPARSE_FILE));
+            const TREE_COPY_OPTIONS *options = batch->operation->options;
+            outcome.error = copy_file_with_flags(source, target,
+                                                 unbuffered ? STDIO_COPY_UNBUFFERED : STDIO_COPY_BUFFERED,
+                                                 flags, options ? options->cancel_event : NULL);
+            /* CopyFile2 owns any cleanup. An unsuccessful call can leave a destination. */
+            outcome.effect = outcome.error ? TREE_COPY_FILE_OUTCOME_UNKNOWN : TREE_COPY_FILE_COPIED;
+            if (!outcome.error)
+                outcome.state = TREE_COPY_COMPLETE;
+            else if (outcome.error == ERROR_REQUEST_ABORTED && options && options->cancel_event &&
+                     WaitForSingleObject(options->cancel_event, 0) == WAIT_OBJECT_0) {
+                outcome.error = ERROR_CANCELLED;
+                outcome.state = TREE_COPY_CANCELLED;
+            }
+        }
+        CloseHandle(pinned);
+    }
+    return outcome;
+}
+
 static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WORK work)
 {
     COPY_BATCH *batch = context;
+    TREE_COPY_RESULT local = {0};
     wchar_t source[32768], target[32768];
     LONG job;
     UNREFERENCED_PARAMETER(instance);
@@ -722,34 +854,30 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
     while ((job = InterlockedIncrement(&batch->next)) < (LONG)batch->count) {
         const FILE_ID_EXTD_DIR_INFO *entry = batch->entries[job];
         size_t length = entry->FileNameLength / sizeof(wchar_t);
-        HANDLE pinned;
-        DWORD error = ERROR_FILENAME_EXCED_RANGE;
-        if (batch->source_length + length < ARRAYSIZE(source) &&
-            batch->target_length + length < ARRAYSIZE(target)) {
-            error = open_copy_entry(batch, batch->source, entry, 0, &pinned);
-            if (!error) {
-                error = portable_file_check(batch, entry, pinned);
-                if (!error) {
-                    DWORD flags = (entry->FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) &&
-                                  (batch->target_flags & FILE_SUPPORTS_SPARSE_FILES) ?
-                                  COPY_FILE_ENABLE_SPARSE_COPY : 0;
-                    BOOL unbuffered = batch->unbuffered_large &&
-                                      (ULONGLONG)entry->EndOfFile.QuadPart >= LARGE_COPY_BYTES &&
-                                      !(entry->FileAttributes & (FILE_ATTRIBUTE_COMPRESSED |
-                                        FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_SPARSE_FILE));
-                    memcpy(source + batch->source_length, entry->FileName, entry->FileNameLength);
-                    source[batch->source_length + length] = 0;
-                    memcpy(target + batch->target_length, entry->FileName, entry->FileNameLength);
-                    target[batch->target_length + length] = 0;
-                    error = copy_file_with_flags(source, target,
-                                                 unbuffered ? STDIO_COPY_UNBUFFERED : STDIO_COPY_BUFFERED,
-                                                 flags);
-                }
-                CloseHandle(pinned);
-            }
+        BOOL path_fits = batch->source_length + length < ARRAYSIZE(source) &&
+                         batch->target_length + length < ARRAYSIZE(target);
+        COPY_OUTCOME outcome = {0};
+        outcome.error = copy_stopped(batch->operation);
+        outcome.state = outcome.error ? copy_skipped_state(outcome.error) : TREE_COPY_FAILED;
+        if (path_fits) {
+            memcpy(source + batch->source_length, entry->FileName, entry->FileNameLength);
+            source[batch->source_length + length] = 0;
+            memcpy(target + batch->target_length, entry->FileName, entry->FileNameLength);
+            target[batch->target_length + length] = 0;
+            if (!outcome.error)
+                outcome = copy_regular_file(batch, entry, source, target);
+        } else if (!outcome.error) {
+            outcome.error = ERROR_FILENAME_EXCED_RANGE;
         }
-        batch->errors[job] = error;
+        if (outcome.state == TREE_COPY_FAILED || outcome.state == TREE_COPY_CANCELLED)
+            copy_stop(batch->operation, outcome.error);
+        copy_report(batch->operation, path_fits ? source : NULL, path_fits ? target : NULL, &entry->FileId,
+                    (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, outcome);
+        count_copy_outcome(&local, outcome);
     }
+    AcquireSRWLockExclusive(&batch->operation->totals_lock);
+    merge_copy_totals(batch->summary, &local);
+    ReleaseSRWLockExclusive(&batch->operation->totals_lock);
 }
 
 static unsigned reserve_copy_helpers(volatile LONG *slots, unsigned limit)
@@ -782,7 +910,7 @@ static void copy_flush(COPY_BATCH *batch)
                 }
             }
         } else if (batch->work) {
-            helpers = min(batch->result->workers - 1, batch->count - 1);
+            helpers = min(batch->summary->totals.workers - 1, batch->count - 1);
         }
     }
     for (i = 0; i < helpers; ++i)
@@ -792,13 +920,6 @@ static void copy_flush(COPY_BATCH *batch)
         WaitForThreadpoolWorkCallbacks(batch->work, FALSE);
         if (batch->helper_slots)
             InterlockedExchangeAdd(batch->helper_slots, (LONG)helpers);
-    }
-    for (i = 0; i < batch->count; ++i) {
-        if (!batch->errors[i]) {
-            ++batch->result->files;
-            batch->result->bytes += (ULONGLONG)batch->entries[i]->EndOfFile.QuadPart;
-        }
-        record_error(batch->result, batch->errors[i]);
     }
     batch->count = 0;
 }
@@ -824,13 +945,34 @@ static DWORD directory_path(HANDLE handle, wchar_t *path, DWORD capacity, size_t
     return ERROR_SUCCESS;
 }
 
-static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
-                            wchar_t *source_path, size_t source_length,
-                            wchar_t *target_path, size_t target_length);
+static COPY_OUTCOME copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
+                                   wchar_t *source_path, size_t source_length,
+                                   wchar_t *target_path, size_t target_length, FILE_BASIC_INFO attributes);
+
+static DWORD check_source_directory(const COPY_BATCH *batch, HANDLE source,
+                                    const FILE_BASIC_INFO *attributes)
+{
+    if ((attributes->FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
+         FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_OFFLINE)) !=
+        FILE_ATTRIBUTE_DIRECTORY)
+        return ERROR_NOT_SUPPORTED;
+    if (batch->source_flags & FILE_NAMED_STREAMS) {
+        FILE_STREAM_INFO stream;
+        DWORD error;
+        /* Directories lack an unnamed data stream. Refuse named streams we cannot preserve. */
+        if (GetFileInformationByHandleEx(source, FileStreamInfo, &stream, sizeof(stream)))
+            return ERROR_NOT_SUPPORTED;
+        error = GetLastError();
+        if (error != ERROR_HANDLE_EOF)
+            return error == ERROR_MORE_DATA || error == ERROR_INSUFFICIENT_BUFFER ?
+                   ERROR_NOT_SUPPORTED : error;
+    }
+    return ERROR_SUCCESS;
+}
 
 typedef struct {
     const FILE_ID_EXTD_DIR_INFO *entry;
-    TREE_RESULT result;
+    TREE_COPY_RESULT summary;
 } COPY_BRANCH;
 
 typedef struct {
@@ -845,33 +987,63 @@ typedef struct {
     volatile LONG helper_slots;
 } COPY_BRANCH_BATCH;
 
-static DWORD copy_child(COPY_BATCH *batch, const COPY_BRANCH_BATCH *branches,
+static void copy_child(COPY_BATCH *batch, const COPY_BRANCH_BATCH *branches,
                         const FILE_ID_EXTD_DIR_INFO *entry, wchar_t *source_path, wchar_t *target_path)
 {
-    HANDLE source_child, target_child;
+    HANDLE source_child = INVALID_HANDLE_VALUE, target_child = INVALID_HANDLE_VALUE;
     size_t units = entry->FileNameLength / sizeof(wchar_t);
     size_t source_end = branches->source_length + units;
     size_t target_end = branches->target_length + units;
-    DWORD error;
-
-    if (source_end + 1 >= 32768 || target_end + 1 >= 32768)
-        return ERROR_FILENAME_EXCED_RANGE;
-    error = open_copy_entry(batch, branches->source, entry, FILE_LIST_DIRECTORY, &source_child);
-    if (error)
-        return error;
-    error = create_child_directory(branches->target, entry->FileName, (USHORT)entry->FileNameLength,
-                                   &target_child);
-    if (!error) {
-        memcpy(source_path + branches->source_length, entry->FileName, entry->FileNameLength);
-        source_path[source_end] = L'\\';
-        memcpy(target_path + branches->target_length, entry->FileName, entry->FileNameLength);
-        target_path[target_end] = L'\\';
-        error = copy_directory(batch, source_child, target_child, branches->child_depth,
-                               source_path, source_end + 1, target_path, target_end + 1);
-        CloseHandle(target_child);
+    BOOL path_fits = source_end + 1 < 32768 && target_end + 1 < 32768;
+    FILE_BASIC_INFO attributes = {0};
+    COPY_OUTCOME outcome = {0};
+    outcome.error = copy_stopped(batch->operation);
+    if (outcome.error) {
+        outcome.state = copy_skipped_state(outcome.error);
+    } else {
+        outcome.state = TREE_COPY_FAILED;
+        if (!path_fits)
+            outcome.error = ERROR_FILENAME_EXCED_RANGE;
+        else if (branches->child_depth == MAX_DEPTH)
+            outcome.error = ERROR_DIRECTORY;
+        else
+            outcome.error = open_copy_entry(batch, branches->source, entry, FILE_LIST_DIRECTORY,
+                                            &source_child, NULL);
+        if (!outcome.error && !GetFileInformationByHandleEx(source_child, FileBasicInfo,
+                                                            &attributes, sizeof(attributes)))
+            outcome.error = GetLastError();
+        if (!outcome.error)
+            outcome.error = check_source_directory(batch, source_child, &attributes);
+        if (!outcome.error) {
+            outcome.error = copy_stopped(batch->operation);
+            if (outcome.error)
+                outcome.state = copy_skipped_state(outcome.error);
+            else
+                outcome.error = create_child_directory(branches->target, entry->FileName,
+                                                       (USHORT)entry->FileNameLength, &target_child);
+        }
     }
-    CloseHandle(source_child);
-    return error;
+    if (path_fits) {
+        memcpy(source_path + branches->source_length, entry->FileName, entry->FileNameLength);
+        memcpy(target_path + branches->target_length, entry->FileName, entry->FileNameLength);
+        if (target_child != INVALID_HANDLE_VALUE) {
+            source_path[source_end] = L'\\';
+            target_path[target_end] = L'\\';
+            outcome = copy_directory(batch, source_child, target_child, branches->child_depth,
+                                     source_path, source_end + 1, target_path, target_end + 1, attributes);
+        }
+        source_path[source_end] = 0;
+        target_path[target_end] = 0;
+    }
+    if (outcome.state == TREE_COPY_FAILED)
+        copy_stop(batch->operation, outcome.error);
+    count_copy_outcome(batch->summary, outcome);
+    copy_report(batch->operation, path_fits ? source_path : NULL, path_fits ? target_path : NULL,
+                &entry->FileId, TRUE, outcome);
+    if (target_child != INVALID_HANDLE_VALUE)
+        CloseHandle(target_child);
+    if (source_child != INVALID_HANDLE_VALUE)
+        CloseHandle(source_child);
 }
 
 static VOID CALLBACK copy_branch_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WORK work)
@@ -894,69 +1066,59 @@ static VOID CALLBACK copy_branch_worker(PTP_CALLBACK_INSTANCE instance, PVOID co
     memcpy(target_path, branches->target_path, branches->target_length * sizeof(*target_path));
     while ((index = InterlockedIncrement(&branches->next)) < (LONG)branches->count) {
         COPY_BRANCH *job = &branches->jobs[index];
-        serial.result = &job->result;
+        serial.summary = &job->summary;
         serial.count = 0;
-        job->result.workers = 1;
-        record_error(&job->result, copy_child(&serial, branches, job->entry, source_path, target_path));
+        serial.summary->totals.workers = 1;
+        copy_child(&serial, branches, job->entry, source_path, target_path);
     }
     if (serial.work)
         CloseThreadpoolWork(serial.work);
     InterlockedIncrement(&branches->helper_slots);
 }
 
-static DWORD copy_branch_flush(COPY_BRANCH_BATCH *branches)
+static void copy_branch_flush(COPY_BRANCH_BATCH *branches)
 {
     COPY_BATCH *batch = branches->parent;
-    TREE_RESULT *result = batch->result;
     PTP_WORK work = NULL;
     unsigned i;
-    DWORD error = ERROR_SUCCESS;
 
     if (branches->count > 1 && batch->branch_environment)
         work = CreateThreadpoolWork(copy_branch_worker, branches, batch->branch_environment);
     if (work) {
-        unsigned active = min(result->workers, branches->count);
+        unsigned active = min(batch->summary->totals.workers, branches->count);
         branches->next = -1;
-        branches->helper_slots = (LONG)(result->workers - active);
+        branches->helper_slots = (LONG)(batch->summary->totals.workers - active);
         for (i = 1; i < active; ++i)
             SubmitThreadpoolWork(work);
         copy_branch_worker(NULL, branches, NULL);
         WaitForThreadpoolWorkCallbacks(work, FALSE);
         CloseThreadpoolWork(work);
-        for (i = 0; i < branches->count; ++i) {
-            const TREE_RESULT *job = &branches->jobs[i].result;
-            result->files += job->files;
-            result->bytes += job->bytes;
-            result->directories += job->directories;
-            result->errors += job->errors;
-            if (!result->error)
-                result->error = job->error;
-        }
+        for (i = 0; i < branches->count; ++i)
+            merge_copy_totals(batch->summary, &branches->jobs[i].summary);
     } else {
-        for (i = 0; i < branches->count && !error && !result->error; ++i)
-            error = copy_child(batch, branches, branches->jobs[i].entry,
-                               branches->source_path, branches->target_path);
+        for (i = 0; i < branches->count; ++i)
+            copy_child(batch, branches, branches->jobs[i].entry,
+                       branches->source_path, branches->target_path);
     }
     branches->count = 0;
-    return error;
 }
 
-static DWORD copy_parallel_children(COPY_BRANCH_BATCH *branches, FILE_ID_EXTD_DIR_INFO *entry)
+static void copy_parallel_children(COPY_BRANCH_BATCH *branches, FILE_ID_EXTD_DIR_INFO *entry)
 {
     COPY_BRANCH jobs[2 * MAX_WORKERS];
-    DWORD error = ERROR_SUCCESS;
     branches->jobs = jobs;
-    for (; entry && !error && !branches->parent->result->error; entry = next_entry(entry)) {
+    for (; entry && !copy_stopped(branches->parent->operation); entry = next_entry(entry)) {
         if (dot_entry(entry) || !ordinary_directory(entry))
             continue;
         jobs[branches->count++] = (COPY_BRANCH){ .entry = entry };
         if (branches->count == ARRAYSIZE(jobs))
-            error = copy_branch_flush(branches);
+            copy_branch_flush(branches);
     }
-    return error ? error : copy_branch_flush(branches);
+    if (branches->count)
+        copy_branch_flush(branches);
 }
 
-static DWORD copy_child_entries(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
+static void copy_child_entries(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
                                 wchar_t *source_path, size_t source_length,
                                 wchar_t *target_path, size_t target_length, FILE_ID_EXTD_DIR_INFO *entry)
 {
@@ -965,101 +1127,97 @@ static DWORD copy_child_entries(COPY_BATCH *batch, HANDLE source, HANDLE target,
         .source_path = source_path, .target_path = target_path,
         .source_length = source_length, .target_length = target_length
     };
-    DWORD error = ERROR_SUCCESS;
     if (batch->branch_environment) {
         FILE_ID_EXTD_DIR_INFO *first = NULL;
         for (; entry; entry = next_entry(entry)) {
             if (!dot_entry(entry) && ordinary_directory(entry)) {
-                if (first)
-                    return copy_parallel_children(&branches, first);
+                if (first) {
+                    copy_parallel_children(&branches, first);
+                    return;
+                }
                 first = entry;
             }
         }
-        return first ? copy_child(batch, &branches, first, source_path, target_path) : ERROR_SUCCESS;
+        if (first)
+            copy_child(batch, &branches, first, source_path, target_path);
+        return;
     }
-    for (; entry && !error && !batch->result->error; entry = next_entry(entry)) {
+    for (; entry && !copy_stopped(batch->operation); entry = next_entry(entry)) {
         if (!dot_entry(entry) && ordinary_directory(entry))
-            error = copy_child(batch, &branches, entry, source_path, target_path);
+            copy_child(batch, &branches, entry, source_path, target_path);
     }
-    return error;
 }
 
-static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
-                            wchar_t *source_path, size_t source_length,
-                            wchar_t *target_path, size_t target_length)
+static COPY_OUTCOME copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, unsigned depth,
+                                   wchar_t *source_path, size_t source_length,
+                                   wchar_t *target_path, size_t target_length, FILE_BASIC_INFO attributes)
 {
     DWORD attributes_mask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |
                             FILE_ATTRIBUTE_ARCHIVE;
     BYTE *buffer;
     DWORD capacity = depth ? DIRECTORY_BUFFER : 128 * 1024;
     unsigned batch_limit = depth ? FILE_BATCH_SIZE : COPY_ROOT_BATCH_SIZE;
-    FILE_BASIC_INFO attributes;
-    DWORD error = ERROR_SUCCESS;
-    if (depth == MAX_DEPTH)
-        return ERROR_DIRECTORY;
-    if (!GetFileInformationByHandleEx(source, FileBasicInfo, &attributes, sizeof(attributes)))
-        return GetLastError();
-    if (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_ENCRYPTED |
-                                     FILE_ATTRIBUTE_COMPRESSED))
-        return ERROR_NOT_SUPPORTED;
+    COPY_OUTCOME outcome = { .state = TREE_COPY_FAILED, .effect = TREE_COPY_DIRECTORY_CREATED };
     if (batch->refs_source || batch->refs_target) {
         FILE_BASIC_INFO target_attributes;
         DWORD integrity = FILE_ATTRIBUTE_INTEGRITY_STREAM | FILE_ATTRIBUTE_NO_SCRUB_DATA;
         if (!GetFileInformationByHandleEx(target, FileBasicInfo, &target_attributes, sizeof(target_attributes)))
-            return GetLastError();
-        if ((attributes.FileAttributes ^ target_attributes.FileAttributes) & integrity)
-            return ERROR_NOT_SUPPORTED;
+            outcome.error = GetLastError();
+        else if ((attributes.FileAttributes ^ target_attributes.FileAttributes) & integrity)
+            outcome.error = ERROR_NOT_SUPPORTED;
+        if (outcome.error)
+            return outcome;
     }
     if (batch->target_flags & FILE_NAMED_STREAMS)
         attributes_mask |= FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
     buffer = malloc(capacity);
-    if (!buffer)
-        return ERROR_NOT_ENOUGH_MEMORY;
-    while (!batch->result->error && enumerate_copy_directory(batch, source, buffer, capacity)) {
+    if (!buffer) {
+        outcome.error = ERROR_NOT_ENOUGH_MEMORY;
+        return outcome;
+    }
+    for (;;) {
         FILE_ID_EXTD_DIR_INFO *entry;
+        outcome.error = copy_stopped(batch->operation);
+        if (outcome.error) {
+            outcome.state = TREE_COPY_INCOMPLETE;
+            break;
+        }
+        if (!enumerate_copy_directory(batch, source, buffer, capacity)) {
+            outcome.error = GetLastError();
+            if (outcome.error == ERROR_NO_MORE_FILES || outcome.error == ERROR_HANDLE_EOF) {
+                attributes.ChangeTime.QuadPart = 0;
+                attributes.FileAttributes &= attributes_mask;
+                if (!attributes.FileAttributes)
+                    attributes.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+                if (!SetFileInformationByHandle(target, FileBasicInfo, &attributes, sizeof(attributes))) {
+                    outcome.error = GetLastError();
+                } else {
+                    outcome.error = ERROR_SUCCESS;
+                    outcome.state = TREE_COPY_COMPLETE;
+                    ++batch->summary->totals.directories;
+                }
+            }
+            break;
+        }
         batch->source = source;
         batch->source_length = source_length;
         batch->target_length = target_length;
         for (entry = (void *)buffer; entry; entry = next_entry(entry)) {
-            if (dot_entry(entry))
-                continue;
-            if (entry->FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)) {
-                error = ERROR_NOT_SUPPORTED;
-                break;
-            }
-            if (ordinary_directory(entry))
+            if (dot_entry(entry) || ordinary_directory(entry))
                 continue;
             batch->entries[batch->count++] = entry;
             if (batch->count == batch_limit)
                 copy_flush(batch);
-            if (batch->result->error)
+            if (copy_stopped(batch->operation))
                 break;
         }
         copy_flush(batch);
-        if (error || batch->result->error)
-            break;
-        error = copy_child_entries(batch, source, target, depth, source_path, source_length, target_path,
-                                   target_length, (void *)buffer);
-        if (error)
-            break;
-    }
-    if (!error && !batch->result->error) {
-        error = GetLastError();
-        if (error == ERROR_NO_MORE_FILES || error == ERROR_HANDLE_EOF) {
-            attributes.ChangeTime.QuadPart = 0;
-            attributes.FileAttributes &= attributes_mask;
-            if (!attributes.FileAttributes)
-                attributes.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-            if (!SetFileInformationByHandle(target, FileBasicInfo, &attributes, sizeof(attributes))) {
-                error = GetLastError();
-            } else {
-                error = ERROR_SUCCESS;
-                ++batch->result->directories;
-            }
-        }
+        if (!copy_stopped(batch->operation))
+            copy_child_entries(batch, source, target, depth, source_path, source_length, target_path,
+                               target_length, (void *)buffer);
     }
     free(buffer);
-    return error;
+    return outcome;
 }
 
 static BOOL copy_supported_filesystem(const wchar_t *name)
@@ -1068,27 +1226,41 @@ static BOOL copy_supported_filesystem(const wchar_t *name)
            !_wcsicmp(name, L"exFAT") || !_wcsicmp(name, L"FAT32");
 }
 
-DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
-                    BOOL unbuffered_large, TREE_RESULT *result)
+DWORD copy_new_tree_report(const wchar_t *input, const wchar_t *output, DWORD workers,
+                           BOOL unbuffered_large, const TREE_COPY_OPTIONS *options,
+                           TREE_COPY_RESULT *summary)
 {
+    COPY_OPERATION operation = { .options = options, .report_lock = SRWLOCK_INIT, .totals_lock = SRWLOCK_INIT };
+    TREE_RESULT *result = &summary->totals;
     COPY_BATCH batch = {0};
+    COPY_OUTCOME root = { .state = TREE_COPY_FAILED };
     HANDLE source = INVALID_HANDLE_VALUE, parent = INVALID_HANDLE_VALUE, target = INVALID_HANDLE_VALUE;
     PTP_POOL pool = NULL;
     TP_CALLBACK_ENVIRON environment;
-    wchar_t *paths, *source_path, *target_path, *destination, *name;
+    wchar_t *paths = NULL, *source_path, *target_path, *destination, *name;
     wchar_t source_fs[16], target_fs[16], *split;
-    DWORD error = ERROR_INVALID_NAME, length;
+    DWORD error, length;
     size_t source_length = 0, target_length = 0;
     FILE_BASIC_INFO properties;
-    ZeroMemory(result, sizeof(*result));
+    FILE_ID_INFO source_id;
+    BOOL have_source_id = FALSE;
+    ZeroMemory(summary, sizeof(*summary));
+    batch.summary = summary;
+    batch.operation = &operation;
+    error = copy_stopped(&operation);
+    if (error) {
+        root.state = copy_skipped_state(error);
+        goto done;
+    }
     paths = malloc(3 * 32768 * sizeof(*paths));
     if (!paths) {
-        record_error(result, ERROR_NOT_ENOUGH_MEMORY);
-        return result->error;
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
     }
     source_path = paths;
     target_path = paths + 32768;
     destination = paths + 2 * 32768;
+    error = ERROR_INVALID_NAME;
     length = GetFullPathNameW(output, 32768, destination, NULL);
     if (length < 4 || length >= 32768 || destination[1] != L':' ||
         destination[2] != L'\\' || wcspbrk(destination + 3, L":*?")) {
@@ -1115,6 +1287,8 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
     error = open_root(input, FALSE, TRUE, &source);
     if (error)
         goto done;
+    if (options && options->report)
+        have_source_id = GetFileInformationByHandleEx(source, FileIdInfo, &source_id, sizeof(source_id));
     if (!GetFileInformationByHandleEx(source, FileBasicInfo, &properties, sizeof(properties)) ||
         !GetVolumeInformationByHandleW(source, NULL, 0, NULL, NULL, &batch.source_flags,
                                        source_fs, ARRAYSIZE(source_fs)) ||
@@ -1123,13 +1297,13 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
         error = GetLastError();
         goto done;
     }
-    if ((properties.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
-                                      FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_COMPRESSED)) !=
-        FILE_ATTRIBUTE_DIRECTORY ||
-        !copy_supported_filesystem(source_fs) || !copy_supported_filesystem(target_fs)) {
+    if (!copy_supported_filesystem(source_fs) || !copy_supported_filesystem(target_fs)) {
         error = ERROR_NOT_SUPPORTED;
         goto done;
     }
+    error = check_source_directory(&batch, source, &properties);
+    if (error)
+        goto done;
     batch.refs_source = !_wcsicmp(source_fs, L"ReFS");
     batch.refs_target = !_wcsicmp(target_fs, L"ReFS");
     batch.legacy_source = !batch.refs_source && _wcsicmp(source_fs, L"NTFS") != 0;
@@ -1145,14 +1319,19 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
         error = ERROR_INVALID_PARAMETER;
         goto done;
     }
+    error = copy_stopped(&operation);
+    if (error) {
+        root.state = copy_skipped_state(error);
+        goto done;
+    }
     error = create_child_directory(parent, name, (USHORT)(wcslen(name) * sizeof(*name)), &target);
     if (error)
         goto done;
+    root.effect = TREE_COPY_DIRECTORY_CREATED;
     error = directory_path(target, target_path, 32768, &target_length);
     if (error)
         goto done;
     result->workers = workers ? min(workers, MAX_WORKERS) : min(storage_workers(input), storage_workers(output));
-    batch.result = result;
     batch.source_path = source_path;
     batch.target_path = target_path;
     if (result->workers > 1) {
@@ -1168,7 +1347,9 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
         else
             result->workers = 1;
     }
-    error = copy_directory(&batch, source, target, 0, source_path, source_length, target_path, target_length);
+    root = copy_directory(&batch, source, target, 0, source_path, source_length, target_path,
+                          target_length, properties);
+    error = root.error;
     if (batch.work)
         CloseThreadpoolWork(batch.work);
     if (pool) {
@@ -1176,6 +1357,10 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
         DestroyThreadpoolEnvironment(&environment);
     }
 done:
+    root.error = error;
+    copy_stop(&operation, error);
+    count_copy_outcome(summary, root);
+    copy_report(&operation, input, output, have_source_id ? &source_id.FileId : NULL, TRUE, root);
     if (target != INVALID_HANDLE_VALUE)
         CloseHandle(target);
     if (source != INVALID_HANDLE_VALUE)
@@ -1183,6 +1368,15 @@ done:
     if (parent != INVALID_HANDLE_VALUE)
         CloseHandle(parent);
     free(paths);
-    record_error(result, error);
+    result->error = (DWORD)ReadAcquire(&operation.stop_error);
     return result->error;
+}
+
+DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
+                    BOOL unbuffered_large, TREE_RESULT *result)
+{
+    TREE_COPY_RESULT summary;
+    DWORD error = copy_new_tree_report(input, output, workers, unbuffered_large, NULL, &summary);
+    *result = summary.totals;
+    return error;
 }

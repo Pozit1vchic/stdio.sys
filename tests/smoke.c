@@ -15,6 +15,144 @@ static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
     return CloseHandle(file) && ok;
 }
 
+typedef struct {
+    unsigned complete_files;
+    unsigned failed_files;
+    unsigned skipped_files;
+    unsigned cancelled_files;
+    unsigned incomplete_directories;
+    unsigned other;
+    HANDLE cancel_after_copy;
+} COPY_TEST_REPORT;
+
+static void count_copy_items(void *context, const TREE_COPY_ITEM *item)
+{
+    COPY_TEST_REPORT *report = context;
+    if (!item->source || !item->destination || !item->source_id) {
+        ++report->other;
+    } else if (!item->directory && item->state == TREE_COPY_COMPLETE &&
+               item->effect == TREE_COPY_FILE_COPIED && !item->error) {
+        ++report->complete_files;
+        if (report->cancel_after_copy)
+            SetEvent(report->cancel_after_copy);
+    } else if (!item->directory && item->state == TREE_COPY_FAILED &&
+               item->effect == TREE_COPY_UNCHANGED && item->error == ERROR_SHARING_VIOLATION) {
+        ++report->failed_files;
+    } else if (!item->directory && item->state == TREE_COPY_SKIPPED &&
+               item->effect == TREE_COPY_UNCHANGED && item->error == ERROR_SHARING_VIOLATION) {
+        ++report->skipped_files;
+    } else if (!item->directory && item->state == TREE_COPY_CANCELLED &&
+               item->effect == TREE_COPY_UNCHANGED && item->error == ERROR_CANCELLED) {
+        ++report->cancelled_files;
+    } else if (item->directory && item->state == TREE_COPY_INCOMPLETE &&
+               item->effect == TREE_COPY_DIRECTORY_CREATED &&
+               (item->error == ERROR_SHARING_VIOLATION || item->error == ERROR_CANCELLED)) {
+        ++report->incomplete_directories;
+    } else {
+        ++report->other;
+    }
+}
+
+static BOOL partial_copy_test(const wchar_t *fixture)
+{
+    wchar_t source[MAX_PATH], target[MAX_PATH], cancelled[MAX_PATH], path[MAX_PATH];
+    TREE_COPY_RESULT summary;
+    TREE_RESULT cleanup;
+    COPY_TEST_REPORT report = {0};
+    TREE_COPY_OPTIONS options = { count_copy_items, &report, NULL };
+    HANDLE lock = INVALID_HANDLE_VALUE;
+    BOOL ok = FALSE;
+    swprintf_s(source, ARRAYSIZE(source), L"%ls\\partial", fixture);
+    swprintf_s(target, ARRAYSIZE(target), L"%ls\\result", fixture);
+    swprintf_s(cancelled, ARRAYSIZE(cancelled), L"%ls\\cancelled", fixture);
+    if (!CreateDirectoryW(source, NULL))
+        goto done;
+    swprintf_s(path, ARRAYSIZE(path), L"%ls\\01.bin", source);
+    if (!make_file(path, "completed", 9))
+        goto done;
+    swprintf_s(path, ARRAYSIZE(path), L"%ls\\02.bin", source);
+    if (!make_file(path, "locked", 6))
+        goto done;
+    lock = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (lock == INVALID_HANDLE_VALUE)
+        goto done;
+    swprintf_s(path, ARRAYSIZE(path), L"%ls\\03.bin", source);
+    if (!make_file(path, "untouched", 9))
+        goto done;
+    if (copy_new_tree_report(source, target, 1, FALSE, &options, &summary) != ERROR_SHARING_VIOLATION ||
+        summary.totals.files != 1 || summary.totals.bytes != 9 || summary.totals.errors != 1 ||
+        summary.totals.directories != 0 || summary.directories_created != 1 ||
+        summary.files_outcome_unknown || summary.skipped != 1 || summary.cancelled ||
+        report.complete_files != 1 || report.failed_files != 1 || report.skipped_files != 1 ||
+        report.incomplete_directories != 1 || report.other)
+        goto done;
+    if (!tree_run(target, FALSE, 1, &cleanup) && cleanup.files == 1 && cleanup.bytes == 9) {
+        CloseHandle(lock);
+        lock = INVALID_HANDLE_VALUE;
+    } else {
+        goto done;
+    }
+    if (copy_new_tree_report(source, target, 1, FALSE, NULL, &summary) != ERROR_ALREADY_EXISTS ||
+        summary.directories_created || summary.totals.files)
+        goto done;
+    ZeroMemory(&report, sizeof(report));
+    options.cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!options.cancel_event)
+        goto done;
+    report.cancel_after_copy = options.cancel_event;
+    if (copy_new_tree_report(source, cancelled, 1, FALSE, &options, &summary) != ERROR_CANCELLED ||
+        summary.totals.files != 1 || summary.totals.errors || summary.directories_created != 1 ||
+        summary.cancelled != 2 || report.complete_files != 1 || report.cancelled_files != 2 ||
+        report.incomplete_directories != 1 || report.other)
+        goto done;
+    if (!tree_run(cancelled, TRUE, 1, &cleanup) &&
+        copy_new_tree_report(source, cancelled, 1, FALSE, &options, &summary) == ERROR_CANCELLED &&
+        summary.cancelled == 1 && !summary.directories_created &&
+        GetFileAttributesW(cancelled) == INVALID_FILE_ATTRIBUTES &&
+        copy_new_tree_report(source, cancelled, 1, FALSE, NULL, &summary) == ERROR_SUCCESS &&
+        summary.totals.files == 3 && summary.totals.directories == 1 &&
+        summary.directories_created == 1)
+        ok = TRUE;
+done:
+    if (options.cancel_event)
+        CloseHandle(options.cancel_event);
+    if (lock != INVALID_HANDLE_VALUE)
+        CloseHandle(lock);
+    tree_run(source, TRUE, 1, &cleanup);
+    tree_run(target, TRUE, 1, &cleanup);
+    tree_run(cancelled, TRUE, 1, &cleanup);
+    return ok;
+}
+
+static BOOL directory_stream_test(const wchar_t *fixture)
+{
+    wchar_t source[MAX_PATH], child[MAX_PATH], target[MAX_PATH], stream[MAX_PATH];
+    TREE_COPY_RESULT summary;
+    TREE_RESULT cleanup;
+    BOOL ok = FALSE;
+    swprintf_s(source, ARRAYSIZE(source), L"%ls\\stream-source", fixture);
+    swprintf_s(child, ARRAYSIZE(child), L"%ls\\child", source);
+    swprintf_s(target, ARRAYSIZE(target), L"%ls\\stream-target", fixture);
+    swprintf_s(stream, ARRAYSIZE(stream), L"%ls:directory-data", source);
+    if (!CreateDirectoryW(source, NULL) || !CreateDirectoryW(child, NULL) ||
+        !make_file(stream, "dir", 3))
+        goto done;
+    if (copy_new_tree_report(source, target, 1, FALSE, NULL, &summary) != ERROR_NOT_SUPPORTED ||
+        summary.directories_created || GetFileAttributesW(target) != INVALID_FILE_ATTRIBUTES ||
+        !DeleteFileW(stream))
+        goto done;
+    swprintf_s(stream, ARRAYSIZE(stream), L"%ls:directory-data", child);
+    if (make_file(stream, "child", 5) &&
+        copy_new_tree_report(source, target, 4, FALSE, NULL, &summary) == ERROR_NOT_SUPPORTED &&
+        summary.directories_created == 1 && !summary.totals.directories && summary.totals.errors == 1 &&
+        !tree_run(target, FALSE, 1, &cleanup) && cleanup.directories == 1)
+        ok = TRUE;
+done:
+    tree_run(source, TRUE, 1, &cleanup);
+    tree_run(target, TRUE, 1, &cleanup);
+    return ok;
+}
+
 static BOOL sparse_copy_test(const wchar_t *root, const wchar_t *tree_copy)
 {
     wchar_t source[MAX_PATH], direct[MAX_PATH], nested[MAX_PATH];
@@ -138,7 +276,10 @@ int wmain(int argc, wchar_t **argv)
     }
     swprintf_s(stream, ARRAYSIZE(stream), L"%ls:meta", copy);
     lock = CreateFileW(stream, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (lock == INVALID_HANDLE_VALUE || GetFileSize(lock, NULL) != 3) {
+    char ads[4];
+    DWORD read;
+    if (lock == INVALID_HANDLE_VALUE || !ReadFile(lock, ads, sizeof(ads), &read, NULL) ||
+        read != 3 || memcmp(ads, "ads", 3)) {
         fputws(L"Copy lost the alternate data stream.\n", stderr);
         goto cleanup;
     }
@@ -169,7 +310,8 @@ int wmain(int argc, wchar_t **argv)
     }
     swprintf_s(stream, ARRAYSIZE(stream), L"%ls\\left\\payload.txt:meta", tree_copy);
     lock = CreateFileW(stream, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (lock == INVALID_HANDLE_VALUE || GetFileSize(lock, NULL) != 3) {
+    if (lock == INVALID_HANDLE_VALUE || !ReadFile(lock, ads, sizeof(ads), &read, NULL) ||
+        read != 3 || memcmp(ads, "ads", 3)) {
         fputws(L"Tree copy lost the alternate data stream.\n", stderr);
         goto cleanup;
     }
@@ -181,6 +323,10 @@ int wmain(int argc, wchar_t **argv)
     }
     if (!sparse_copy_test(root, tree_copy) || tree_run(tree_copy, TRUE, 4, &result)) {
         fputws(L"Sparse file copy failed.\n", stderr);
+        goto cleanup;
+    }
+    if (!partial_copy_test(root) || !directory_stream_test(root)) {
+        fputws(L"Partial copy, cancellation or directory stream handling failed.\n", stderr);
         goto cleanup;
     }
     lock = CreateFileW(copy, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);

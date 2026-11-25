@@ -31,6 +31,52 @@ typedef enum {
     STDIO_COPY_NO_PREALLOCATION
 } STDIO_COPY_MODE;
 DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode);
+typedef enum {
+    TREE_COPY_UNCHANGED,
+    TREE_COPY_DIRECTORY_CREATED,
+    TREE_COPY_FILE_COPIED,
+    TREE_COPY_FILE_OUTCOME_UNKNOWN
+} TREE_COPY_EFFECT;
+
+typedef enum {
+    TREE_COPY_COMPLETE,
+    TREE_COPY_FAILED,
+    TREE_COPY_SKIPPED,
+    TREE_COPY_CANCELLED,
+    TREE_COPY_INCOMPLETE
+} TREE_COPY_STATE;
+
+typedef struct {
+    const wchar_t *source;
+    const wchar_t *destination;
+    const FILE_ID_128 *source_id;
+    BOOL directory;
+    TREE_COPY_STATE state;
+    TREE_COPY_EFFECT effect;
+    DWORD error;
+} TREE_COPY_ITEM;
+
+/* Paths and ID are borrowed during the callback. Callbacks run serially on copy workers.
+   A report covers attempted objects and work skipped from queues already populated.
+   Traversal stops on failure, so descendants of unopened folders are not enumerated. */
+typedef void (*TREE_COPY_REPORT)(void *context, const TREE_COPY_ITEM *item);
+typedef struct {
+    TREE_COPY_REPORT report;
+    void *context;
+    HANDLE cancel_event; /* Optional, caller-owned manual-reset event. */
+} TREE_COPY_OPTIONS;
+
+typedef struct {
+    TREE_RESULT totals;
+    ULONGLONG directories_created;
+    ULONGLONG files_outcome_unknown;
+    ULONGLONG skipped;
+    ULONGLONG cancelled;
+} TREE_COPY_RESULT;
+
+DWORD copy_new_tree_report(const wchar_t *source, const wchar_t *destination, DWORD workers,
+                           BOOL unbuffered_large, const TREE_COPY_OPTIONS *options,
+                           TREE_COPY_RESULT *result);
 DWORD copy_new_tree(const wchar_t *source, const wchar_t *destination, DWORD workers,
                     BOOL unbuffered_large, TREE_RESULT *result);
 HRESULT shell_operation(const wchar_t *verb, int count, wchar_t **paths,

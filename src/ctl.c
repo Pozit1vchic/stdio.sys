@@ -33,7 +33,7 @@ static int help(void)
            L"  recycle PATH [PATH ...]\n"
            L"  shell-delete --yes PATH [PATH ...]\n"
            L"  copy DESTINATION SOURCE [SOURCE ...]\n"
-           L"  copy-new NEW_DIRECTORY SOURCE_DIRECTORY [auto|1..16] [--unbuffered-large]\n"
+           L"  copy-new NEW_DIRECTORY SOURCE_DIRECTORY [auto|1..16] [--unbuffered-large] [--report-items]\n"
            L"  move DESTINATION SOURCE [SOURCE ...]\n"
            L"  move-new NEW_PATH SOURCE (same volume)\n"
            L"  copy-file SOURCE NEW_FILE [--unbuffered|--no-preallocation]\n"
@@ -47,6 +47,20 @@ static int help(void)
            L"  measure LABEL FILES cold|warm|as-created zero|robocopy EXE [ARGS ...]\n",
            stderr);
     return 2;
+}
+
+static void report_copy_item(void *context, const TREE_COPY_ITEM *item)
+{
+    static const wchar_t *const states[] = {
+        L"complete", L"failed", L"skipped", L"cancelled", L"incomplete"
+    };
+    static const wchar_t *const effects[] = {
+        L"untouched", L"directory-created", L"file-copied", L"file-outcome-unknown"
+    };
+    UNREFERENCED_PARAMETER(context);
+    wprintf(L"%ls\t%ls\t%ls\t0x%08lX\t%ls\t%ls\n", item->directory ? L"directory" : L"file",
+            states[item->state], effects[item->effect], item->error,
+            item->source ? item->source : L"", item->destination ? item->destination : L"");
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -87,17 +101,35 @@ int wmain(int argc, wchar_t **argv)
         error = (DWORD)shell_operation(verb, argc - 2, argv + 2, NULL, GetConsoleWindow(), FALSE);
     } else if (argc >= 4 && (!wcscmp(verb, L"copy") || !wcscmp(verb, L"move"))) {
         error = (DWORD)shell_operation(verb, argc - 3, argv + 3, argv[2], GetConsoleWindow(), FALSE);
-    } else if (argc >= 4 && argc <= 6 && !wcscmp(verb, L"copy-new")) {
-        TREE_RESULT result;
-        BOOL unbuffered = argc > 4 && !wcscmp(argv[argc - 1], L"--unbuffered-large");
-        int arguments = argc - unbuffered;
+    } else if (argc >= 4 && argc <= 7 && !wcscmp(verb, L"copy-new")) {
+        TREE_COPY_RESULT summary;
+        const TREE_RESULT *result = &summary.totals;
+        TREE_COPY_OPTIONS options = {0};
+        BOOL unbuffered = FALSE;
+        int option = 4;
         count = 0;
-        if (arguments > 5 || (arguments == 5 && wcscmp(argv[4], L"auto") &&
-            (!parse_unsigned(argv[4], &count) || !count || count > 16)))
-            return help();
-        error = copy_new_tree(argv[3], argv[2], (DWORD)count, unbuffered, &result);
+        if (option < argc && wcsncmp(argv[option], L"--", 2)) {
+            if (wcscmp(argv[option], L"auto") &&
+                (!parse_unsigned(argv[option], &count) || !count || count > 16))
+                return help();
+            ++option;
+        }
+        for (; option < argc; ++option) {
+            if (!unbuffered && !wcscmp(argv[option], L"--unbuffered-large"))
+                unbuffered = TRUE;
+            else if (!options.report && !wcscmp(argv[option], L"--report-items"))
+                options.report = report_copy_item;
+            else
+                return help();
+        }
+        error = copy_new_tree_report(argv[3], argv[2], (DWORD)count, unbuffered,
+                                     options.report ? &options : NULL, &summary);
         wprintf(L"files=%llu directories=%llu bytes=%llu errors=%llu workers=%lu\n",
-                result.files, result.directories, result.bytes, result.errors, result.workers);
+                result->files, result->directories, result->bytes, result->errors, result->workers);
+        if (error || options.report)
+            wprintf(L"directories_created=%llu files_outcome_unknown=%llu skipped=%llu cancelled=%llu\n",
+                    summary.directories_created, summary.files_outcome_unknown,
+                    summary.skipped, summary.cancelled);
     } else if (argc >= 4 && !wcscmp(verb, L"shell-delete") && !wcscmp(argv[2], L"--yes")) {
         error = (DWORD)shell_operation(L"delete", argc - 3, argv + 3, NULL, NULL, TRUE);
     } else if (argc >= 4 && argc <= 6 && (!wcscmp(verb, L"copy-file") || !wcscmp(verb, L"bench-copy"))) {
