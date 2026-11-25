@@ -30,6 +30,9 @@ if(BUILD_TESTING)
     add_executable(stdio_smoke tests/smoke.c)
     target_link_libraries(stdio_smoke PRIVATE engine)
     add_test(NAME stdio.smoke COMMAND stdio_smoke "$<TARGET_FILE:stdio_extension>")
+    add_executable(stdio_folder_streams tests/folder_streams.c src/folder_streams.c)
+    target_include_directories(stdio_folder_streams PRIVATE src)
+    add_test(NAME stdio.folder_streams COMMAND stdio_folder_streams)
     add_test(NAME stdio.index COMMAND powershell.exe -NoLogo -NoProfile -NonInteractive
              -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/index.ps1"
              "$<TARGET_FILE:stdioctl>" "${CMAKE_CURRENT_BINARY_DIR}")
