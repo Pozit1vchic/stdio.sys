@@ -1,0 +1,5 @@
+threads	queue_per_thread	interlocked	mib_per_second	measured_bytes
+1	16	False	196.82	1653604352
+4	4	True	337.26	2833252352
+4	4	True	295.72	2480930816
+1	16	False	182.78	1534066688
