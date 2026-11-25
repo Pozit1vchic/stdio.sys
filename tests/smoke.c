@@ -59,7 +59,7 @@ static BOOL partial_copy_test(const wchar_t *fixture)
     TREE_COPY_RESULT summary;
     TREE_RESULT cleanup;
     COPY_TEST_REPORT report = {0};
-    TREE_COPY_OPTIONS options = { count_copy_items, &report, NULL };
+    TREE_COPY_OPTIONS options = { .report = count_copy_items, .context = &report };
     HANDLE lock = INVALID_HANDLE_VALUE;
     BOOL ok = FALSE;
     swprintf_s(source, ARRAYSIZE(source), L"%ls\\partial", fixture);

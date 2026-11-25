@@ -66,6 +66,7 @@ typedef struct {
     TREE_COPY_REPORT report;
     void *context;
     HANDLE cancel_event; /* Optional, caller-owned manual-reset event. */
+    BOOL background; /* Yield device capacity to waiting interactive operations. */
 } TREE_COPY_OPTIONS;
 
 typedef struct {

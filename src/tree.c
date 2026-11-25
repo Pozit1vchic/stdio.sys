@@ -170,7 +170,7 @@ static void delete_job(DELETE_JOB *job, IO_DEVICE device)
 {
     HANDLE file;
     IO_PERMIT permit;
-    job->error = io_budget_acquire(&permit, device, device, NULL);
+    job->error = io_budget_acquire(&permit, device, device, NULL, FALSE);
     if (job->error)
         return;
     job->error = open_entry(job->parent, job->entry, DELETE, SHARE_READ_ONLY, TRUE, &file, NULL);
@@ -891,7 +891,8 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
                 COPY_OPERATION *operation = batch->operation;
                 HANDLE cancel = operation->options ? operation->options->cancel_event : NULL;
                 outcome.error = io_budget_acquire(&permit, operation->source_device,
-                                                  operation->target_device, cancel);
+                                                  operation->target_device, cancel,
+                                                  operation->options && operation->options->background);
                 if (!outcome.error) {
                     outcome.error = copy_stopped(operation);
                     if (!outcome.error)

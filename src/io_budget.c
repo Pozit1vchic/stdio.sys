@@ -5,6 +5,18 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE available = CONDITION_VARIABLE_INIT;
 static IO_PERMIT *active;
 
+typedef struct IO_WAIT {
+    struct IO_WAIT *next;
+    IO_DEVICE source, destination;
+    ULONGLONG queued_at;
+    HANDLE cancel;
+    BOOL background;
+} IO_WAIT;
+
+static IO_WAIT *waiting;
+/* Once promoted, a background request has its original FIFO position. */
+enum { BACKGROUND_PROMOTION_MS = 500 };
+
 IO_DEVICE io_device_for_path(const wchar_t *path, DWORD limit)
 {
     wchar_t volume[MAX_PATH], device[MAX_PATH];
@@ -45,16 +57,57 @@ static BOOL fits(IO_DEVICE device)
     return used < limit;
 }
 
-DWORD io_budget_acquire(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destination, HANDLE cancel)
+static BOOL overlaps(IO_DEVICE left, IO_DEVICE right)
+{
+    return !left.known || !right.known || left.disk == right.disk;
+}
+
+static BOOL promoted(const IO_WAIT *request, ULONGLONG now)
+{
+    return !request->background || now - request->queued_at >= BACKGROUND_PROMOTION_MS;
+}
+
+static BOOL has_predecessor(const IO_WAIT *request)
+{
+    ULONGLONG now = GetTickCount64();
+    BOOL priority = promoted(request, now);
+    BOOL earlier = TRUE;
+    for (const IO_WAIT *other = waiting; other; other = other->next) {
+        BOOL other_priority;
+        if (other == request) {
+            earlier = FALSE;
+            continue;
+        }
+        other_priority = promoted(other, now);
+        if ((other_priority > priority || (earlier && other_priority == priority)) &&
+            (overlaps(request->source, other->source) ||
+             overlaps(request->source, other->destination) ||
+             overlaps(request->destination, other->source) ||
+             overlaps(request->destination, other->destination)) &&
+            (!other->cancel || WaitForSingleObject(other->cancel, 0) != WAIT_OBJECT_0) &&
+            fits(other->source) && fits(other->destination))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+DWORD io_budget_acquire(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destination,
+                        HANDLE cancel, BOOL background)
 {
     DWORD error = ERROR_SUCCESS;
+    IO_WAIT request = { NULL, source, destination, 0, cancel, background };
+    IO_WAIT **link;
     AcquireSRWLockExclusive(&lock);
+    request.queued_at = GetTickCount64();
+    for (link = &waiting; *link; link = &(*link)->next)
+        ;
+    *link = &request;
     for (;;) {
         if (cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0) {
             error = ERROR_CANCELLED;
             break;
         }
-        if (fits(source) && fits(destination)) {
+        if (fits(source) && fits(destination) && !has_predecessor(&request)) {
             *permit = (IO_PERMIT){ active, source, destination };
             active = permit;
             break;
@@ -65,7 +118,12 @@ DWORD io_budget_acquire(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destinati
             break;
         }
     }
+    for (link = &waiting; *link != &request; link = &(*link)->next)
+        ;
+    *link = request.next;
     ReleaseSRWLockExclusive(&lock);
+    /* A request elsewhere in the queue may now be eligible on a separate disk. */
+    WakeAllConditionVariable(&available);
     return error;
 }
 
