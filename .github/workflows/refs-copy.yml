@@ -1,0 +1,105 @@
+name: Large ReFS copy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/refs-copy.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  refs-copy:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Build and run smoke tests
+        run: |
+          git init
+          git fetch --depth=1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:GITHUB_SHA
+          git checkout --detach FETCH_HEAD
+          cmake -S . -B build -A x64
+          cmake --build build --config Release
+          ctest --test-dir build -C Release --output-on-failure
+
+      - name: Measure ReFS copies with SHA-256 verification
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cli = (Resolve-Path build/Release/stdioctl.exe).Path
+          $work = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString()))
+          $vhd = Join-Path $work.FullName 'stdio-refs.vhdx'
+          $diskpartScript = Join-Path $work.FullName 'create.txt'
+          ('create vdisk file="{0}" maximum=65536 type=expandable' -f $vhd) | Set-Content -LiteralPath $diskpartScript -Encoding ascii
+          try {
+            & diskpart /s $diskpartScript
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $vhd -PathType Leaf)) {
+              throw 'Could not create the test VHDX'
+            }
+            $image = Mount-DiskImage -ImagePath $vhd -PassThru
+            $disk = @($image | Get-Disk)
+            if ($disk.Count -ne 1 -or $disk[0].BusType -ne 'File Backed Virtual' -or
+                $disk[0].PartitionStyle -ne 'RAW' -or $disk[0].IsBoot -or $disk[0].IsSystem) {
+              throw 'The new image did not resolve to a single uninitialized virtual disk'
+            }
+            $partition = $disk[0] | Initialize-Disk -PassThru -PartitionStyle GPT |
+              New-Partition -UseMaximumSize -AssignDriveLetter
+            $volume = $partition | Format-Volume -FileSystem ReFS -NewFileSystemLabel 'stdio-refs-test' -Confirm:$false
+            $root = "$($volume.DriveLetter):\"
+            $lab = (New-Item -ItemType Directory -Path (Join-Path $root 'lab')).FullName
+            $info = & $cli storage-info $lab
+            $info
+            if ($LASTEXITCODE -ne 0 -or ($info -join ' ') -notmatch '\bfilesystem=ReFS\s+block_clone=1\b') {
+              throw 'The test volume did not report ReFS block clone support'
+            }
+            foreach ($mib in @(10240, 20480, 30720)) {
+              $hostFree = (Get-Item -LiteralPath $work.FullName).PSDrive.Free
+              if ($hostFree -lt (($mib + 1024) * 1MB)) {
+                if ($mib -eq 10240) { throw 'Insufficient host storage for the 10 GiB test' }
+                Write-Output "Skipping ${mib} MiB due to insufficient host storage"
+                continue
+              }
+              $output = & $cli prepare-large $lab $mib
+              $output
+              $fixture = @($output | Where-Object { $_.StartsWith('path=') })
+              if ($LASTEXITCODE -ne 0 -or $fixture.Count -ne 1) { throw 'Fixture creation failed' }
+              $source = Join-Path $fixture[0].Substring(5) 'file-0000000.needle'
+              $destination = Join-Path $lab 'copy.bin'
+              $freeBefore = (Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
+              & $cli bench-copy $source $destination
+              if ($LASTEXITCODE -ne 0) { throw 'Copy or SHA-256 verification failed' }
+              $freeAfter = (Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
+              $allocated = [long]$freeBefore - [long]$freeAfter
+              Write-Output "mib=$mib volume_bytes_allocated=$allocated"
+              if ($allocated -gt 1GB) { throw 'Copy allocated more than 1 GiB on the ReFS volume' }
+              $original = [IO.File]::OpenRead($source)
+              try {
+                $copy = [IO.File]::Open($destination, 'Open', 'ReadWrite', 'None')
+                try {
+                  $first = $original.ReadByte()
+                  if ($first -lt 0 -or $copy.ReadByte() -ne $first) { throw 'Unexpected first byte' }
+                  $copy.Position = 0
+                  $copy.WriteByte([byte]($first -bxor 255))
+                  $copy.Flush($true)
+                  $original.Position = 0
+                  if ($original.ReadByte() -ne $first) { throw 'Writing the copy changed the source' }
+                } finally {
+                  $copy.Dispose()
+                }
+              } finally {
+                $original.Dispose()
+              }
+              Remove-Item -LiteralPath $destination, $source
+              [IO.Directory]::Delete($fixture[0].Substring(5))
+            }
+          } finally {
+            if (Test-Path -LiteralPath $vhd -PathType Leaf) {
+              if ((Get-DiskImage -ImagePath $vhd).Attached) { Dismount-DiskImage -ImagePath $vhd }
+              Remove-Item -LiteralPath $vhd
+            }
+            Remove-Item -LiteralPath $diskpartScript
+            [IO.Directory]::Delete($work.FullName)
+          }
