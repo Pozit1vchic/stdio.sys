@@ -1,0 +1,3 @@
+variant	free_before_fixture_bytes	copy_and_flush_seconds	disk_read_bytes	disk_written_bytes	sha256_matches
+default	172508893184	20.604923	1042944	10745954304	true
+no-preallocation	172508893184	21.053982	21481472	10774745088	true
