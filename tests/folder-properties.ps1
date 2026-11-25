@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
-    [string]$Tool
+    [string]$Tool,
+    [string]$LabDll,
+    [switch]$LabPassThrough
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop on local NTFS.
@@ -15,6 +17,34 @@ using System.Threading;
 
 public static class FolderPropertiesProbe
 {
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate uint InstallLab(bool stockOnly);
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate int CountLabHits();
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibrary(string path);
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    public static CountLabHits StartLab(string path, bool stockOnly)
+    {
+        var module = LoadLibrary(path);
+        if (module == IntPtr.Zero)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        var installAddress = GetProcAddress(module, "ShellStreamLabInstall");
+        var countAddress = GetProcAddress(module, "ShellStreamLabHits");
+        if (installAddress == IntPtr.Zero || countAddress == IntPtr.Zero)
+            throw new InvalidOperationException("Missing Shell experiment exports.");
+        var install = Marshal.GetDelegateForFunctionPointer<InstallLab>(installAddress);
+        var error = install(stockOnly);
+        if (error != 0)
+            throw new System.ComponentModel.Win32Exception((int)error);
+        return Marshal.GetDelegateForFunctionPointer<CountLabHits>(countAddress);
+    }
+
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern bool SHObjectProperties(IntPtr owner, uint kind, string path, string page);
 
@@ -102,6 +132,10 @@ function Read-ByteCount([string]$Text) {
 }
 
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
+$lab = $null
+if ($LabDll) {
+    $lab = [FolderPropertiesProbe]::StartLab((Resolve-Path -LiteralPath $LabDll).ProviderPath, $LabPassThrough)
+}
 $cases = 'plain', 'hardlink', 'sparse', 'junction', 'fileStream', 'directoryStream', 'accessDenied'
 $ordinaryAllocation = $null
 foreach ($case in $cases) {
@@ -145,7 +179,9 @@ foreach ($case in $cases) {
                 }
             }
         }
+        $hitsBefore = if ($lab) { $lab.Invoke() } else { 0 }
         $fields = Read-Properties $path
+        $hits = if ($lab) { $lab.Invoke() - $hitsBefore } else { 0 }
         $logical = Read-ByteCount $fields[13064]
         $allocated = Read-ByteCount $fields[13106]
         $expectedBytes = switch ($case) {
@@ -163,6 +199,10 @@ foreach ($case in $cases) {
         $counts = @([regex]::Matches($fields[13087], '[0-9]+') | ForEach-Object { [int]$_.Value })
         if ($logical -ne $expectedBytes -or ($counts -join ',') -ne "$expectedFiles,1") {
             throw "Unexpected native totals for ${case}: $logical bytes, $($fields[13087])"
+        }
+        $expectedHits = if ($lab -and !$LabPassThrough) { $expectedFiles } else { 0 }
+        if ($hits -ne $expectedHits) {
+            throw "Unexpected number of optimized requests for ${case}: $hits"
         }
         switch ($case) {
             plain { $ordinaryAllocation = $allocated }
@@ -192,6 +232,7 @@ foreach ($case in $cases) {
             ShellSizeOnDisk = $fields[13106]
             ShellContains = $fields[13087]
             Engine = $engine
+            OptimizedRequests = $hits
         }
     } finally {
         if ($originalAcl) { Set-Acl -LiteralPath $nested -AclObject $originalAcl }
