@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [ValidateRange(1, 50000)][int]$FileCount = 10000,
-    [ValidateRange(1, 30)][int]$Rounds = 5
+    [ValidateRange(1, 30)][int]$Rounds = 5,
+    [switch]$Search
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop.
@@ -68,6 +69,9 @@ $scope = [Windows.Automation.TreeScope]::Descendants
 $firstItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) 'fixture-00000.bin'
 $statusGroup = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'System.StatusBarViewItemCount'
 $statusValue = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'PropertyValue'
+$searchEdit = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'SearchEditBox'
+$listPane = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'listview'
+$expectedCount = if ($Search) { 1 } else { $FileCount }
 $view = $null
 try {
     [void][IO.Directory]::CreateDirectory($target)
@@ -89,25 +93,41 @@ try {
         [void](Wait-TestValue {
             !$view.Busy -and $view.Document.Folder.Self.Path -eq $control
         })
+        if ($Search) {
+            $view.Navigate2($target)
+            $box = Wait-TestValue {
+                if ($view.Busy -or $view.Document.Folder.Self.Path -ne $target) { return }
+                $ui = [Windows.Automation.AutomationElement]::FromHandle($window)
+                $group = $ui.FindFirst($scope, $statusGroup)
+                if (!$group) { return }
+                $value = $group.FindFirst($scope, $statusValue)
+                if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$FileCount) {
+                    $ui.FindFirst($scope, $searchEdit)
+                }
+            }
+            $searchValue = $box.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
+        }
         $explorer.Refresh()
         $cpuStart = $explorer.TotalProcessorTime.TotalMilliseconds
         $ioStart = [ExplorerViewOwner]::ReadIo($explorer.Handle)
         $navigationStart = [DateTime]::UtcNow
         $clock = [Diagnostics.Stopwatch]::StartNew()
-        $view.Navigate2($target)
+        if ($Search) { $searchValue.SetValue('fixture-00000') } else { $view.Navigate2($target) }
         $sample = @{ First = $null }
         $total = Wait-TestValue {
-            if ($view.Document.Folder.Self.Path -ne $target) { return }
+            if (!$Search -and $view.Document.Folder.Self.Path -ne $target) { return }
+            if ($Search -and $view.LocationName -notlike '*fixture-00000*') { return }
             $ui = [Windows.Automation.AutomationElement]::FromHandle($window)
             try {
-                if ($null -eq $sample.First -and $ui.FindFirst($scope, $firstItem)) {
+                $list = $ui.FindFirst($scope, $listPane)
+                if ($null -eq $sample.First -and $list -and $list.FindFirst($scope, $firstItem)) {
                     $sample.First = $clock.Elapsed.TotalMilliseconds
                 }
                 if ($null -eq $sample.First) { return }
                 $group = $ui.FindFirst($scope, $statusGroup)
                 if (!$group) { return }
                 $value = $group.FindFirst($scope, $statusValue)
-                if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$FileCount) {
+                if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$expectedCount) {
                     return $clock.Elapsed.TotalMilliseconds
                 }
             } catch [Windows.Automation.ElementNotAvailableException] {
@@ -122,6 +142,7 @@ try {
             NavigationStartUtc = $navigationStart.ToString('o')
             ExplorerPatcher = $(if ($patcher) { $patcher.FileVersionInfo.FileVersion })
             Files = $FileCount
+            Operation = $(if ($Search) { 'Search' } else { 'Navigation' })
             FirstItemMs = [Math]::Round($sample.First, 2)
             FullCountMs = [Math]::Round($total, 2)
             ProcessCpuMs = [Math]::Round($explorer.TotalProcessorTime.TotalMilliseconds - $cpuStart, 2)
