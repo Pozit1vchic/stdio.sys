@@ -102,7 +102,7 @@ function Read-ByteCount([string]$Text) {
 }
 
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
-$cases = 'plain', 'hardlink', 'sparse', 'junction', 'fileStream', 'directoryStream'
+$cases = 'plain', 'hardlink', 'sparse', 'junction', 'fileStream', 'directoryStream', 'accessDenied'
 $ordinaryAllocation = $null
 foreach ($case in $cases) {
     $name = 'stdio-props-' + [guid]::NewGuid().ToString('N')
@@ -111,6 +111,7 @@ foreach ($case in $cases) {
     $junction = Join-Path $path 'link'
     $first = Join-Path $path 'first.bin'
     $second = Join-Path $nested 'second.bin'
+    $originalAcl = $null
     try {
         [void][IO.Directory]::CreateDirectory($nested)
         [IO.File]::WriteAllBytes($first, [byte[]]::new(17))
@@ -129,12 +130,36 @@ foreach ($case in $cases) {
             junction { New-Item -ItemType Junction -Path $junction -Target $nested | Out-Null }
             fileStream { Set-Content -LiteralPath $first -Stream payload -Value ('z' * 8000) -NoNewline }
             directoryStream { Set-Content -LiteralPath $nested -Stream payload -Value ('y' * 12000) -NoNewline }
+            accessDenied {
+                $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+                $originalAcl = Get-Acl -LiteralPath $nested
+                $acl = Get-Acl -LiteralPath $nested
+                $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                    $identity, 'ListDirectory', 'Deny'))
+                Set-Acl -LiteralPath $nested -AclObject $acl
+                try {
+                    [void][IO.Directory]::GetFiles($nested)
+                    throw 'Test ACL did not deny listing the nested directory.'
+                } catch {
+                    if ($_.Exception.InnerException -isnot [UnauthorizedAccessException]) { throw }
+                }
+            }
         }
         $fields = Read-Properties $path
         $logical = Read-ByteCount $fields[13064]
         $allocated = Read-ByteCount $fields[13106]
-        $expectedBytes = switch ($case) { hardlink { 40977 }; sparse { 8409105 }; default { 20497 } }
-        $expectedFiles = if ($case -in 'hardlink', 'sparse') { 3 } else { 2 }
+        $expectedBytes = switch ($case) {
+            hardlink { 40977 }
+            sparse { 8409105 }
+            accessDenied { 17 }
+            default { 20497 }
+        }
+        $expectedFiles = switch ($case) {
+            hardlink { 3 }
+            sparse { 3 }
+            accessDenied { 1 }
+            default { 2 }
+        }
         $counts = @([regex]::Matches($fields[13087], '[0-9]+') | ForEach-Object { [int]$_.Value })
         if ($logical -ne $expectedBytes -or ($counts -join ',') -ne "$expectedFiles,1") {
             throw "Unexpected native totals for ${case}: $logical bytes, $($fields[13087])"
@@ -147,6 +172,9 @@ foreach ($case in $cases) {
             hardlink {
                 if ($allocated -le $ordinaryAllocation) { throw 'Hardlink did not increase allocation.' }
             }
+            accessDenied {
+                if ($allocated -ge $ordinaryAllocation) { throw 'Shell included the denied file allocation.' }
+            }
             default {
                 if ($allocated -ne $ordinaryAllocation) { throw "Unexpected native allocation for $case" }
             }
@@ -154,7 +182,9 @@ foreach ($case in $cases) {
         $engine = $null
         if ($Tool) {
             $engine = & $Tool size $path
-            if ($LASTEXITCODE) { throw "Engine rejected $case" }
+            # The CLI exit status is 1 for partial traversal, with the Win32 error on stderr.
+            $expectedExit = if ($case -eq 'accessDenied') { 1 } else { 0 }
+            if ($LASTEXITCODE -ne $expectedExit) { throw "Unexpected engine exit code for $case" }
         }
         [pscustomobject]@{
             Case = $case
@@ -164,6 +194,7 @@ foreach ($case in $cases) {
             Engine = $engine
         }
     } finally {
+        if ($originalAcl) { Set-Acl -LiteralPath $nested -AclObject $originalAcl }
         if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
         if (Test-Path -LiteralPath $path) { [IO.Directory]::Delete($path, $true) }
     }
