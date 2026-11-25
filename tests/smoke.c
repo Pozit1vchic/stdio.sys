@@ -4,6 +4,7 @@
 #include <wchar.h>
 #include "../src/engine.h"
 #include "../src/copy_budget.h"
+#include "../src/native_stat.h"
 
 static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
 {
@@ -14,6 +15,81 @@ static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
         return FALSE;
     ok = WriteFile(file, data, length, &written, NULL) && written == length;
     return CloseHandle(file) && ok;
+}
+
+typedef struct {
+    ULONGLONG parent;
+    unsigned first, alias, extra, unexpected;
+} LINK_TEST;
+
+static DWORD check_link(void *context, ULONGLONG parent, const wchar_t *name, DWORD units)
+{
+    LINK_TEST *links = context;
+    if (parent == links->parent && units == 9 && !wmemcmp(name, L"first.bin", units))
+        ++links->first;
+    else if (parent == links->parent && units == 9 && !wmemcmp(name, L"alias.bin", units))
+        ++links->alias;
+    else if (parent == links->parent && units == 12 && !wmemcmp(name, L"extra-", 6))
+        ++links->extra;
+    else
+        ++links->unexpected;
+    return ERROR_SUCCESS;
+}
+
+static BOOL hardlink_id_test(const wchar_t *root)
+{
+    wchar_t first[MAX_PATH], alias[MAX_PATH], extra[MAX_PATH];
+    HANDLE directory, file;
+    BY_HANDLE_FILE_INFORMATION parent_info, file_info;
+    ULONGLONG id;
+    LINK_TEST links = {0};
+    BOOL ok = FALSE;
+    unsigned created = 0;
+    swprintf_s(first, ARRAYSIZE(first), L"%ls\\first.bin", root);
+    swprintf_s(alias, ARRAYSIZE(alias), L"%ls\\alias.bin", root);
+    directory = CreateFileW(root, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                            FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (directory == INVALID_HANDLE_VALUE)
+        return FALSE;
+    if (!GetFileInformationByHandle(directory, &parent_info) ||
+        !make_file(first, "links", 5) || !CreateHardLinkW(alias, first, NULL))
+        goto done;
+    file = CreateFileW(first, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        goto done;
+    ok = GetFileInformationByHandle(file, &file_info);
+    CloseHandle(file);
+    if (!ok)
+        goto done;
+    id = ((ULONGLONG)file_info.nFileIndexHigh << 32) | file_info.nFileIndexLow;
+    links.parent = ((ULONGLONG)parent_info.nFileIndexHigh << 32) | parent_info.nFileIndexLow;
+    ok = !ntfs_visit_links(directory, id, check_link, &links) &&
+         links.first == 1 && links.alias == 1 && !links.unexpected &&
+         DeleteFileW(first);
+    if (ok) {
+        links.first = links.alias = 0;
+        ok = !ntfs_visit_links(directory, id, check_link, &links) &&
+             !links.first && links.alias == 1 && !links.unexpected;
+    }
+    if (ok) {
+        for (; created < 40; ++created) {
+            swprintf_s(extra, ARRAYSIZE(extra), L"%ls\\extra-%02u.bin", root, created);
+            if (!CreateHardLinkW(extra, alias, NULL))
+                break;
+        }
+        links.alias = 0;
+        ok = created == 40 && !ntfs_visit_links(directory, id, check_link, &links) &&
+             !links.first && links.alias == 1 && links.extra == 40 && !links.unexpected;
+    }
+done:
+    while (created) {
+        swprintf_s(extra, ARRAYSIZE(extra), L"%ls\\extra-%02u.bin", root, --created);
+        DeleteFileW(extra);
+    }
+    DeleteFileW(first);
+    DeleteFileW(alias);
+    CloseHandle(directory);
+    return ok;
 }
 
 typedef struct {
@@ -358,6 +434,10 @@ int wmain(int argc, wchar_t **argv)
     }
     if (!sparse_copy_test(root, tree_copy) || tree_run(tree_copy, TRUE, 4, &result)) {
         fputws(L"Sparse file copy failed.\n", stderr);
+        goto cleanup;
+    }
+    if (!hardlink_id_test(root)) {
+        fputws(L"Could not enumerate hardlink names by file ID.\n", stderr);
         goto cleanup;
     }
     if (!copy_admission_test(root, tree_copy)) {

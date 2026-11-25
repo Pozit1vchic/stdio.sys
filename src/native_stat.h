@@ -11,3 +11,7 @@ typedef struct {
 BOOL query_native_stat(HANDLE handle, NATIVE_FILE_STAT *stat);
 /* The caller owns a writable extended DOS path, restored before return. */
 DWORD open_indexed_file(wchar_t *path, HANDLE *out);
+
+typedef DWORD (*NTFS_LINK_VISITOR)(void *context, ULONGLONG parent, const wchar_t *name, DWORD units);
+/* Names are borrowed during the callback. The caller must validate each path before publishing it. */
+DWORD ntfs_visit_links(HANDLE volume_hint, ULONGLONG id, NTFS_LINK_VISITOR visitor, void *context);
