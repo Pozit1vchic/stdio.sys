@@ -1,0 +1,4 @@
+mode	queue	mib_per_second	measured_bytes
+iocp	4	472.84	3968860160
+iocp	16	490.96	4125097984
+ioring	16	474.69	3988783104
