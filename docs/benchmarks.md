@@ -267,7 +267,7 @@ Microsoft DiskSpd 2.3 работал с заранее записанным те
 
 #### Пропускная способность NVMe по секундам
 
-На том же NVMe Windows сообщила текущий и максимальный режим PCIe 3.0 ×4. Запрос `StorageDeviceWriteCacheProperty` подтвердил включённый кэш с отложенной записью и поддержку сброса. Журнал NVMe сообщил около 62 °C до и после серии, без выставленного температурного предупреждения в этих опросах. Настройки накопителя не менялись. [Свойства кэша записи](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-storage_write_cache_property) · [Диагностика NVMe в Windows](https://learn.microsoft.com/en-us/windows/win32/fileio/working-with-nvme-devices)
+На том же NVMe Windows сообщила текущий и максимальный режим PCIe 3.0 ×4. Запрос `StorageDeviceWriteCacheProperty` подтвердил включённый кэш с отложенной записью и поддержку сброса. Журнал NVMe сообщил около 62 °C в двух опросах, во время серии и после её окончания. В обоих опросах температурного предупреждения не было. Настройки накопителя не менялись. [Свойства кэша записи](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-storage_write_cache_property) · [Диагностика NVMe в Windows](https://learn.microsoft.com/en-us/windows/win32/fileio/working-with-nvme-devices)
 
 DiskSpd 2.3 прогонял 12-ГиБ тестовый файл на NTFS блоками 1 МиБ с очередью 16. Каждый режим длился 10 секунд без прогрева. `-D1000 -Rxml` собирал количество завершённых операций по секундам. Все режимы обходили кэш Windows. В режиме `-Sh` дополнительно запрашивалась сквозная запись. [Параметры DiskSpd](https://github.com/microsoft/diskspd/wiki/Command-line-and-parameters)
 
