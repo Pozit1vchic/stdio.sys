@@ -9,3 +9,5 @@ typedef struct {
 } NATIVE_FILE_STAT;
 
 BOOL query_native_stat(HANDLE handle, NATIVE_FILE_STAT *stat);
+/* The caller owns a writable extended DOS path, restored before return. */
+DWORD open_indexed_file(wchar_t *path, HANDLE *out);

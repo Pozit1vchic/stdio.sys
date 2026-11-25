@@ -79,6 +79,20 @@ static DWORD native_open(HANDLE parent, const wchar_t *name, USHORT bytes,
     return native_file(parent, name, bytes, access, sharing, FILE_OPEN, 0, out);
 }
 
+DWORD open_indexed_file(wchar_t *path, HANDLE *out)
+{
+    size_t length = wcslen(path);
+    DWORD error;
+    if (length < 7 || length > USHRT_MAX / sizeof(wchar_t) ||
+        wcsncmp(path, L"\\\\?\\", 4) || path[5] != L':' || path[6] != L'\\')
+        return ERROR_INVALID_NAME;
+    path[1] = L'?'; /* Convert \\?\ to the native DOS prefix \??\. */
+    error = native_open(NULL, path, (USHORT)(length * sizeof(wchar_t)),
+                        FILE_READ_ATTRIBUTES | SYNCHRONIZE, SHARE_ALL, out);
+    path[1] = L'\\';
+    return error;
+}
+
 static BOOL local_storage(const wchar_t *root)
 {
     UINT type = GetDriveTypeW(root);

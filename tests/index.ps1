@@ -75,6 +75,18 @@ try {
     Assert-Count 'path \right\burst-' 1500
     Assert-Count 'path \relocated\burst-' 0
     Assert-Response 'snapshot-stats' '^full_refreshes=[3-9] refreshed_directories='
+    $relocated = Join-Path $fixture 'relocated'
+    $moved = Join-Path $fixture 'moved'
+    [IO.Directory]::Move($relocated, $moved)
+    $junction = Join-Path $fixture 'relocated'
+    New-Item -ItemType Junction -Path $junction -Target $moved | Out-Null
+    try {
+        Assert-Count 'path \relocated\' 0
+        Assert-Count 'path \moved\' 1
+        Assert-Count "name-exact $name" 1
+    } finally {
+        [IO.Directory]::Delete($junction)
+    }
     $writer.WriteLine('quit')
     if (!$process.WaitForExit(5000) -or $process.ExitCode) {
         throw 'The index process did not exit successfully.'

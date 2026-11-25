@@ -296,8 +296,8 @@ typedef struct {
     wchar_t path[1024];
 } PARENT_PATH;
 
-static const wchar_t *entry_path_cached(const INDEX *index, const INDEX_ENTRY *entry,
-                                       wchar_t *buffer, PARENT_PATH *cache)
+static wchar_t *entry_path_cached(const INDEX *index, const INDEX_ENTRY *entry,
+                                  wchar_t *buffer, PARENT_PATH *cache)
 {
     wchar_t *start = buffer + PATH_CHARS - 1;
     size_t depth = 0, prefix_length = wcslen(index->prefix);
@@ -355,17 +355,15 @@ static BOOL contains(const wchar_t *value, const wchar_t *needle)
     return FindStringOrdinal(FIND_FROMSTART, value, -1, needle, -1, TRUE) >= 0;
 }
 
-static BOOL verify_match(const INDEX_ENTRY *entry, const wchar_t *path, ULONGLONG min_size,
+static BOOL verify_match(const INDEX_ENTRY *entry, wchar_t *path, ULONGLONG min_size,
                          ULONGLONG max_size, ULONGLONG *size)
 {
     BY_HANDLE_FILE_INFORMATION info;
     NATIVE_FILE_STAT stat;
     DWORDLONG id = 0;
     BOOL ok;
-    HANDLE handle = CreateFileW(path, FILE_READ_ATTRIBUTES,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                               OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (handle == INVALID_HANDLE_VALUE)
+    HANDLE handle;
+    if (open_indexed_file(path, &handle))
         return FALSE;
     if (query_native_stat(handle, &stat)) {
         ok = TRUE;
@@ -391,7 +389,7 @@ typedef struct {
 static const wchar_t *lookup_match(const SEARCH_QUERY *query, const INDEX_ENTRY *entry,
                                    wchar_t *buffer, PARENT_PATH *cache, ULONGLONG *size)
 {
-    const wchar_t *path = entry_path_cached(query->index, entry, buffer, cache);
+    wchar_t *path = entry_path_cached(query->index, entry, buffer, cache);
     if (!path || (query->path_needle && !contains(path + 4, query->path_needle)) ||
         !verify_match(entry, path, query->low, query->high, size))
         return NULL;
