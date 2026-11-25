@@ -14,7 +14,7 @@ add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00
 add_compile_options(/W4 /WX /utf-8 /guard:cf)
 add_link_options(/guard:cf /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /MACHINE:X64)
 
-add_library(engine STATIC src/tree.c src/shell.c src/index.c src/io_budget.c)
+add_library(engine STATIC src/tree.c src/shell.c src/index.c src/io_budget.c src/copy_budget.c)
 target_link_libraries(engine PUBLIC ntdll shell32 ole32 uuid advapi32)
 add_executable(stdio WIN32 src/main.c)
 target_link_libraries(stdio PRIVATE engine)

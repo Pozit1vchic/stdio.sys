@@ -3,6 +3,7 @@
 #include <winioctl.h>
 #include <wchar.h>
 #include "../src/engine.h"
+#include "../src/copy_budget.h"
 
 static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
 {
@@ -121,6 +122,40 @@ done:
     tree_run(source, TRUE, 1, &cleanup);
     tree_run(target, TRUE, 1, &cleanup);
     tree_run(cancelled, TRUE, 1, &cleanup);
+    return ok;
+}
+
+static BOOL copy_admission_test(const wchar_t *source, const wchar_t *target)
+{
+    TREE_COPY_RESULT summary;
+    TREE_RESULT cleanup;
+    TREE_COPY_OPTIONS options = {0};
+    unsigned reservations = 0;
+    BOOL ok;
+    while (reservations < 4 && copy_budget_try_acquire())
+        ++reservations;
+    options.cancel_event = CreateEventW(NULL, TRUE, TRUE, NULL);
+    ok = reservations && options.cancel_event &&
+         copy_new_tree_report(source, target, 1, FALSE, &options, &summary) == ERROR_CANCELLED &&
+         !summary.directories_created &&
+         copy_new_tree_report(source, target, 1, FALSE, NULL, &summary) == ERROR_BUSY &&
+         !summary.directories_created &&
+         GetFileAttributesW(target) == INVALID_FILE_ATTRIBUTES;
+    if (options.cancel_event)
+        CloseHandle(options.cancel_event);
+    while (reservations) {
+        copy_budget_release();
+        --reservations;
+    }
+    if (ok) {
+        TREE_RESULT expected;
+        if (tree_run(source, FALSE, 1, &expected))
+            return FALSE;
+        ok = !copy_new_tree_report(source, target, 1, FALSE, NULL, &summary) &&
+             summary.totals.files == expected.files && summary.totals.bytes == expected.bytes;
+        if (summary.directories_created && tree_run(target, TRUE, 1, &cleanup))
+            ok = FALSE;
+    }
     return ok;
 }
 
@@ -323,6 +358,10 @@ int wmain(int argc, wchar_t **argv)
     }
     if (!sparse_copy_test(root, tree_copy) || tree_run(tree_copy, TRUE, 4, &result)) {
         fputws(L"Sparse file copy failed.\n", stderr);
+        goto cleanup;
+    }
+    if (!copy_admission_test(root, tree_copy)) {
+        fputws(L"Copy admission or retry failed.\n", stderr);
         goto cleanup;
     }
     if (!partial_copy_test(root) || !directory_stream_test(root)) {

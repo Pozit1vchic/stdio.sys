@@ -1,6 +1,7 @@
 #include "engine.h"
 #include "native_stat.h"
 #include "io_budget.h"
+#include "copy_budget.h"
 #include <winternl.h>
 #include <winioctl.h>
 #include <stddef.h>
@@ -1282,12 +1283,18 @@ DWORD copy_new_tree_report(const wchar_t *input, const wchar_t *output, DWORD wo
     FILE_BASIC_INFO properties;
     FILE_ID_INFO source_id;
     BOOL have_source_id = FALSE;
+    BOOL admitted = FALSE;
     ZeroMemory(summary, sizeof(*summary));
     batch.summary = summary;
     batch.operation = &operation;
     error = copy_stopped(&operation);
     if (error) {
         root.state = copy_skipped_state(error);
+        goto done;
+    }
+    admitted = copy_budget_try_acquire();
+    if (!admitted) {
+        error = ERROR_BUSY;
         goto done;
     }
     paths = malloc(3 * 32768 * sizeof(*paths));
@@ -1414,6 +1421,8 @@ done:
     if (parent != INVALID_HANDLE_VALUE)
         CloseHandle(parent);
     free(paths);
+    if (admitted)
+        copy_budget_release();
     result->error = (DWORD)ReadAcquire(&operation.stop_error);
     return result->error;
 }

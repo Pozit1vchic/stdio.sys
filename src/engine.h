@@ -77,6 +77,7 @@ typedef struct {
     ULONGLONG cancelled;
 } TREE_COPY_RESULT;
 
+/* ERROR_BUSY means admission was denied before opening either path or creating the destination. */
 DWORD copy_new_tree_report(const wchar_t *source, const wchar_t *destination, DWORD workers,
                            BOOL unbuffered_large, const TREE_COPY_OPTIONS *options,
                            TREE_COPY_RESULT *result);
