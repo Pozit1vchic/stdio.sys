@@ -2,6 +2,9 @@ name: Large ReFS copy
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [src/tree.c, .github/workflows/refs-copy.yml]
 
 permissions:
   contents: read
@@ -66,7 +69,8 @@ jobs:
               $source = Join-Path $fixture[0].Substring(5) 'file-0000000.needle'
               $destination = Join-Path $lab 'copy.bin'
               $freeBefore = (Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
-              & $cli bench-copy $source $destination
+              $singleCopyReport = & $cli bench-copy $source $destination
+              $singleCopyReport
               if ($LASTEXITCODE -ne 0) { throw 'Copy or SHA-256 verification failed' }
               $freeAfter = (Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
               $allocated = [long]$freeBefore - [long]$freeAfter
@@ -90,6 +94,43 @@ jobs:
                 $original.Dispose()
               }
               Remove-Item -LiteralPath $destination
+              if ($mib -eq 10240) {
+                if ($singleCopyReport -notmatch 'sha256=([0-9a-f]{64})$') { throw 'Missing reference checksum' }
+                $expectedHash = $Matches[1]
+                $nested = (New-Item -ItemType Directory -Path (Join-Path $fixture[0].Substring(5) 'nested')).FullName
+                $small = Join-Path $nested 'note.txt'
+                [IO.File]::WriteAllText($small, 'large copy tree')
+                Set-Content -LiteralPath $small -Stream 'stdio-meta' -Value 'metadata' -NoNewline
+                $tree = Join-Path $lab 'tree-copy'
+                $freeBefore = (Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
+                $timer = [Diagnostics.Stopwatch]::StartNew()
+                & $cli copy-new $tree $fixture[0].Substring(5) 4
+                if ($LASTEXITCODE -ne 0) { throw 'ReFS copy-new failed' }
+                $largeCopy = Join-Path $tree ([IO.Path]::GetFileName($source))
+                $smallCopy = Join-Path $tree 'nested\note.txt'
+                foreach ($path in @($largeCopy, $smallCopy, ($smallCopy + ':stdio-meta'))) {
+                  $stream = [IO.File]::Open($path, 'Open', 'Write', 'Read')
+                  try { $stream.Flush($true) } finally { $stream.Dispose() }
+                }
+                $timer.Stop()
+                $allocated = [long]$freeBefore - [long](Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
+                $stream = [IO.FileStream]::new($largeCopy, 'Open', 'Read', 'Read', 1MB, 'SequentialScan')
+                try { $treeHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)) }
+                finally { $stream.Dispose() }
+                if ((Get-Item -LiteralPath $largeCopy).Length -ne 10GB -or $treeHash -ne $expectedHash -or
+                    [IO.File]::ReadAllText($smallCopy) -ne 'large copy tree' -or
+                    (Get-Content -LiteralPath $smallCopy -Stream 'stdio-meta' -Raw) -ne 'metadata' -or
+                    (Get-Item -LiteralPath (Join-Path $tree 'nested')).LastWriteTimeUtc -ne
+                      (Get-Item -LiteralPath $nested).LastWriteTimeUtc -or $allocated -gt 1GB) {
+                  throw 'ReFS tree content, metadata or clone allocation verification failed'
+                }
+                Write-Output "tree_mode=copy-new mib=$mib copy_and_flush_seconds=$($timer.Elapsed.TotalSeconds) net_volume_used_bytes=$allocated sha256=$treeHash"
+                Remove-Item -LiteralPath $small, $smallCopy, $largeCopy
+                [IO.Directory]::Delete($nested)
+                [IO.Directory]::Delete((Join-Path $tree 'nested'))
+                [IO.Directory]::Delete($tree)
+                if ($env:GITHUB_EVENT_NAME -eq 'push') { break }
+              }
               if ($mib -eq 10240 -and (Get-Item -LiteralPath $work.FullName).PSDrive.Free -gt 11GB) {
                 $comparison = (New-Item -ItemType Directory -Path (Join-Path $lab 'robocopy')).FullName
                 $filename = [IO.Path]::GetFileName($source)

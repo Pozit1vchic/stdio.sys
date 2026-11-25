@@ -127,7 +127,7 @@ static DWORD remove_open(HANDLE handle)
 }
 
 static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCESS_MASK access,
-                        ULONG sharing, HANDLE *handle)
+                        ULONG sharing, BOOL use_native_stat, HANDLE *handle)
 {
     FILE_ID_INFO id;
     FILE_ATTRIBUTE_TAG_INFO tag;
@@ -138,7 +138,7 @@ static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCES
                               FILE_READ_ATTRIBUTES | SYNCHRONIZE | access, sharing, handle);
     if (error)
         return error;
-    if (query_native_stat(*handle, &stat)) {
+    if (use_native_stat && query_native_stat(*handle, &stat)) {
         memcpy(stat_id.Identifier, &stat.file_id.QuadPart, sizeof(stat.file_id.QuadPart));
         if (memcmp(&stat_id, &entry->FileId, sizeof(stat_id)) ||
             ((stat.attributes ^ entry->FileAttributes) & mask))
@@ -158,7 +158,7 @@ static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCES
 static void delete_job(DELETE_JOB *job)
 {
     HANDLE file;
-    job->error = open_entry(job->parent, job->entry, DELETE, SHARE_READ_ONLY, &file);
+    job->error = open_entry(job->parent, job->entry, DELETE, SHARE_READ_ONLY, TRUE, &file);
     if (!job->error) {
         job->error = remove_open(file);
         CloseHandle(file);
@@ -286,7 +286,7 @@ static void walk_directory(WALK *walk, HANDLE directory, unsigned depth, ULONGLO
             if (dot_entry(entry) || !ordinary_directory(entry))
                 continue;
             error = open_entry(directory, entry, FILE_LIST_DIRECTORY | (walk->remove ? DELETE : 0),
-                               walk->remove ? SHARE_READ_ONLY : SHARE_ALL, &child);
+                               walk->remove ? SHARE_READ_ONLY : SHARE_ALL, TRUE, &child);
             if (!error) {
                 walk_directory(walk, child, depth + 1, ntfs_id(&entry->FileId));
                 CloseHandle(child);
@@ -603,6 +603,8 @@ typedef struct {
     DWORD source_flags;
     DWORD target_flags;
     BOOL legacy_source;
+    BOOL refs_source;
+    BOOL refs_target;
     BOOL fat32;
     BOOL unbuffered_large;
     const FILE_ID_EXTD_DIR_INFO *entries[COPY_ROOT_BATCH_SIZE];
@@ -619,7 +621,7 @@ static DWORD open_copy_entry(const COPY_BATCH *batch, HANDLE parent, const FILE_
     DWORDLONG expected = ntfs_id(&entry->FileId);
     const DWORD type_mask = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
     if (!batch->legacy_source)
-        return open_entry(parent, entry, access, SHARE_READ_ONLY, handle);
+        return open_entry(parent, entry, access, SHARE_READ_ONLY, !batch->refs_source, handle);
     if (!expected)
         return ERROR_NOT_SUPPORTED;
     error = native_open(parent, entry->FileName, (USHORT)entry->FileNameLength,
@@ -979,6 +981,14 @@ static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, uns
     if (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_ENCRYPTED |
                                      FILE_ATTRIBUTE_COMPRESSED))
         return ERROR_NOT_SUPPORTED;
+    if (batch->refs_source || batch->refs_target) {
+        FILE_BASIC_INFO target_attributes;
+        DWORD integrity = FILE_ATTRIBUTE_INTEGRITY_STREAM | FILE_ATTRIBUTE_NO_SCRUB_DATA;
+        if (!GetFileInformationByHandleEx(target, FileBasicInfo, &target_attributes, sizeof(target_attributes)))
+            return GetLastError();
+        if ((attributes.FileAttributes ^ target_attributes.FileAttributes) & integrity)
+            return ERROR_NOT_SUPPORTED;
+    }
     if (batch->target_flags & FILE_NAMED_STREAMS)
         attributes_mask |= FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
     buffer = malloc(capacity);
@@ -1029,6 +1039,12 @@ static DWORD copy_directory(COPY_BATCH *batch, HANDLE source, HANDLE target, uns
     }
     free(buffer);
     return error;
+}
+
+static BOOL copy_supported_filesystem(const wchar_t *name)
+{
+    return !_wcsicmp(name, L"NTFS") || !_wcsicmp(name, L"ReFS") ||
+           !_wcsicmp(name, L"exFAT") || !_wcsicmp(name, L"FAT32");
 }
 
 DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
@@ -1089,12 +1105,13 @@ DWORD copy_new_tree(const wchar_t *input, const wchar_t *output, DWORD workers,
     if ((properties.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
                                       FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_COMPRESSED)) !=
         FILE_ATTRIBUTE_DIRECTORY ||
-        (_wcsicmp(source_fs, L"NTFS") && _wcsicmp(source_fs, L"exFAT") && _wcsicmp(source_fs, L"FAT32")) ||
-        (_wcsicmp(target_fs, L"NTFS") && _wcsicmp(target_fs, L"exFAT") && _wcsicmp(target_fs, L"FAT32"))) {
+        !copy_supported_filesystem(source_fs) || !copy_supported_filesystem(target_fs)) {
         error = ERROR_NOT_SUPPORTED;
         goto done;
     }
-    batch.legacy_source = _wcsicmp(source_fs, L"NTFS") != 0;
+    batch.refs_source = !_wcsicmp(source_fs, L"ReFS");
+    batch.refs_target = !_wcsicmp(target_fs, L"ReFS");
+    batch.legacy_source = !batch.refs_source && _wcsicmp(source_fs, L"NTFS") != 0;
     batch.fat32 = !_wcsicmp(target_fs, L"FAT32");
     batch.unbuffered_large = unbuffered_large;
     error = directory_path(source, source_path, 32768, &source_length);
