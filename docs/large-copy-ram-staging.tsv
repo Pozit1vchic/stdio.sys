@@ -1,0 +1,4 @@
+mib	variant	read_seconds	copy_and_flush_seconds	sha256_matches
+10240	CopyFile2	NA	28.405589	true
+10240	staged-buffered	2.031528	23.397295	true
+10240	staged-direct	2.018960	22.549770	true
