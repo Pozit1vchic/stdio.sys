@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [switch]$RequireExplorerPatcher,
     [string]$LabDll,
-    [switch]$LabPassThrough
+    [switch]$LabPassThrough,
+    [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop.
@@ -104,21 +105,43 @@ public static class ExplorerProcessProbe
 }
 "@
 
-function Wait-For([scriptblock]$Read, [string]$ErrorMessage) {
+function Wait-For([scriptblock]$Read, [string]$ErrorMessage, [int]$PollMilliseconds = 50) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     do {
         $value = & $Read
         if ($value) { return $value }
-        Start-Sleep -Milliseconds 50
+        Start-Sleep -Milliseconds $PollMilliseconds
     } while ($watch.ElapsedMilliseconds -lt 7000)
     throw $ErrorMessage
+}
+
+function Read-ByteCount([string]$Display) {
+    if ($Display -match '\((?<exact>[^()]*)\)\s*$') { $Display = $Matches['exact'] }
+    return [uint64]($Display -replace '[^0-9]', '')
+}
+
+function Test-ContainsFiles([string]$Display, [int]$Expected) {
+    $numbers = [regex]::Matches($Display, '[0-9]+(?:[ ,\.\u00a0\u202f][0-9]{3})*')
+    return $numbers.Count -eq 2 -and
+        (Read-ByteCount $numbers[0].Value) -eq $Expected -and
+        (Read-ByteCount $numbers[1].Value) -eq 0
+}
+
+function Find-PropertiesWindow {
+    foreach ($element in $desktop.FindAll('Children', $dialogOwner)) {
+        try {
+            if (([string]$element.Current.Name).Contains($name)) { return $element }
+        } catch [Windows.Automation.ElementNotAvailableException] {
+            # A window can close between enumeration and the property read.
+        }
+    }
 }
 
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $root = Join-Path $parent ('stdio-host-' + [guid]::NewGuid().ToString('N'))
 $name = 'stdio-properties-' + [guid]::NewGuid().ToString('N')
 $child = Join-Path $root $name
-$payload = Join-Path $child 'payload.bin'
+$expectedBytes = [uint64]16384 * $FileCount
 $before = @(Get-Process explorer | Select-Object -ExpandProperty Id)
 $desktop = [Windows.Automation.AutomationElement]::RootElement
 $shell = New-Object -ComObject Shell.Application
@@ -130,7 +153,10 @@ $labDirectory = $null
 
 try {
     [void][IO.Directory]::CreateDirectory($child)
-    [IO.File]::WriteAllBytes($payload, [byte[]]::new(16384))
+    $payload = [byte[]]::new(16384)
+    for ($i = 0; $i -lt $FileCount; $i++) {
+        [IO.File]::WriteAllBytes((Join-Path $child "$i.bin"), $payload)
+    }
     Start-Process (Join-Path $env:windir 'explorer.exe') -ArgumentList "/separate,`"$root`""
     $view = Wait-For {
         $shell.Windows() | Where-Object { $_.Document.Folder.Self.Path -eq $root } | Select-Object -First 1
@@ -140,6 +166,8 @@ try {
     if (!$owner -or $owner -in $before) {
         throw 'The test window belongs to an existing Explorer process.'
     }
+    $dialogOwner = New-Object Windows.Automation.PropertyCondition(
+        [Windows.Automation.AutomationElement]::ProcessIdProperty, [int]$owner)
     $explorer = Get-Process -Id $owner
     if ($explorer.Path -ne (Join-Path $env:windir 'explorer.exe')) {
         throw 'The test window does not belong to Windows Explorer.'
@@ -161,11 +189,10 @@ try {
 
     $item = $view.Document.Folder.ParseName($name)
     if (!$item) { throw 'The test folder is missing from the Explorer view.' }
+    $baselineCpu = $explorer.TotalProcessorTime.TotalMilliseconds
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $item.InvokeVerb('properties')
-    $dialog = Wait-For {
-        $desktop.FindAll('Children', $any) | Where-Object { $_.Current.Name.Contains($name) } |
-            Select-Object -First 1
-    } 'Explorer did not open the properties window.'
+    $dialog = Wait-For { Find-PropertiesWindow } 'Explorer did not open the properties window.' 10
     $dialogHandle = [IntPtr]$dialog.Current.NativeWindowHandle
     if ($dialog.Current.ProcessId -ne $owner) {
         throw 'Properties ran in a different process from the isolated Explorer window.'
@@ -179,10 +206,17 @@ try {
                 $values[$current.AutomationId] = $current.Name
             }
         }
-        if ($values.Count -eq 3 -and $values['13064'] -match '16[^0-9]384') { $values }
-    } 'Explorer did not publish the expected 16384-byte size.'
+        if ($values.Count -eq 3 -and
+            (Read-ByteCount $values['13064']) -eq $expectedBytes -and
+            (Read-ByteCount $values['13106']) -eq $expectedBytes -and
+            (Test-ContainsFiles $values['13087'] $FileCount)) { $values }
+    } "Explorer did not publish the expected totals for $FileCount files." 10
+    $elapsed = $watch.Elapsed.TotalMilliseconds
 
     $explorer.Refresh()
+    $cpu = $explorer.TotalProcessorTime.TotalMilliseconds - $baselineCpu
+    $peakWorkingSet = $explorer.PeakWorkingSet64
+    $privateBytes = $explorer.PrivateMemorySize64
     $image = $explorer.Modules | Where-Object { $_.ModuleName -eq 'shell32.dll' } | Select-Object -First 1
     $patcher = $explorer.Modules | Where-Object { $_.ModuleName -eq 'ExplorerPatcher.amd64.dll' } |
         Select-Object -First 1
@@ -219,7 +253,7 @@ try {
     }
 
     $hits = if ($dll) { [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits') } else { 0 }
-    $expectedHits = if ($dll -and !$LabPassThrough) { 1 } else { 0 }
+    $expectedHits = if ($dll -and !$LabPassThrough) { $FileCount } else { 0 }
     if ($hits -ne $expectedHits) { throw "Expected $expectedHits optimized requests, found $hits." }
     if ($dll) {
         [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
@@ -227,15 +261,11 @@ try {
             throw 'Could not close the first properties dialog.'
         }
         [void](Wait-For {
-            $open = $desktop.FindAll('Children', $any) | Where-Object { $_.Current.Name.Contains($name) }
-            !$open
+            !(Find-PropertiesWindow)
         } 'The first properties dialog did not close.')
         $dialogHandle = [IntPtr]::Zero
         $item.InvokeVerb('properties')
-        $again = Wait-For {
-            $desktop.FindAll('Children', $any) | Where-Object { $_.Current.Name.Contains($name) } |
-                Select-Object -First 1
-        } 'Explorer did not reopen the properties dialog.'
+        $again = Wait-For { Find-PropertiesWindow } 'Explorer did not reopen the properties dialog.'
         $dialogHandle = [IntPtr]$again.Current.NativeWindowHandle
         if ($again.Current.ProcessId -ne $owner) {
             throw 'The reopened dialog belongs to a different process.'
@@ -262,6 +292,11 @@ try {
         ComparedCodeBytes = $(if ($dll) { 32 } else { 44 })
         OptimizedRequests = $hits
         VerifiedDisable = [bool]$dll
+        FileCount = $FileCount
+        FinalFieldsMilliseconds = [Math]::Round($elapsed, 2)
+        ProcessCpuMilliseconds = [Math]::Round($cpu, 2)
+        ProcessPeakWorkingSetBytes = $peakWorkingSet
+        ProcessPrivateBytes = $privateBytes
     }
 } finally {
     if ($dll -and $view) {
@@ -272,7 +307,9 @@ try {
         [void][ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     }
     if ($view) { $view.Quit() }
-    [IO.File]::Delete($payload)
+    for ($i = 0; $i -lt $FileCount; $i++) {
+        [IO.File]::Delete((Join-Path $child "$i.bin"))
+    }
     if ([IO.Directory]::Exists($child)) { [IO.Directory]::Delete($child) }
     if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
     if ($labDirectory) {
