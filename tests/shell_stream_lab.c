@@ -17,9 +17,10 @@ static SHELL_STREAMS original;
 static volatile LONG hits;
 static volatile LONG requests;
 static volatile LONG pause_claimed;
-static BOOL passthrough;
+static volatile LONG passthrough;
 static HANDLE resume_first;
 static HANDLE size_worker;
+static BOOL explorer_host;
 
 static HRESULT read_streams(PCWSTR path, SHELL_STREAM_VISITOR *visitor)
 {
@@ -34,7 +35,8 @@ static HRESULT read_streams(PCWSTR path, SHELL_STREAM_VISITOR *visitor)
     } else {
         InterlockedIncrement(&requests);
     }
-    if (passthrough)
+    if (InterlockedCompareExchange(&passthrough, 0, 0) ||
+        (explorer_host && !wcsstr(path, L"\\stdio-properties-")))
         return original(path, visitor);
     file = CreateFileW(path, FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
@@ -126,8 +128,7 @@ __declspec(dllexport) DWORD WINAPI ShellStreamLabWaitForWorker(void)
     return result;
 }
 
-/* Call before starting any property worker in the disposable test process. */
-__declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only, BOOL pause_first)
+static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
 {
     const BYTE expected[] = {0xE8, 0xD0, 0xAF, 0x1A, 0x00};
     const BYTE jump[] = {0xFF, 0x25, 0, 0, 0, 0};
@@ -147,7 +148,7 @@ __declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only, BOOL p
     if (!length || length >= ARRAYSIZE(process))
         return ERROR_NOT_SUPPORTED;
     name = wcsrchr(process, L'\\');
-    if (!name || _wcsicmp(name + 1, L"powershell.exe"))
+    if (!name || _wcsicmp(name + 1, for_explorer ? L"explorer.exe" : L"powershell.exe"))
         return ERROR_NOT_SUPPORTED;
     shell = (BYTE *)GetModuleHandleW(L"shell32.dll");
     if (!shell || !expected_image((HMODULE)shell))
@@ -206,10 +207,42 @@ __declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only, BOOL p
     }
     original = (SHELL_STREAMS)(stub + fallback_offset);
     passthrough = stock_only;
+    explorer_host = for_explorer;
     relative = (int32_t)((uintptr_t)stub - from);
-    memcpy(call + 1, &relative, sizeof(relative));
-    if (!FlushInstructionCache(GetCurrentProcess(), call, sizeof(expected)) ||
-        !VirtualProtect(call, sizeof(expected), old, &ignore))
-        TerminateProcess(GetCurrentProcess(), ERROR_INVALID_STATE);
+    /* The operand is naturally aligned on the checked image. */
+    InterlockedExchange((volatile LONG *)(call + 1), relative);
+    {
+        BOOL flushed = FlushInstructionCache(GetCurrentProcess(), call, sizeof(expected));
+        BOOL restored = VirtualProtect(call, sizeof(expected), old, &ignore);
+        if (!flushed || !restored)
+            return ERROR_INVALID_STATE;
+    }
     return ERROR_SUCCESS;
+}
+
+/* Call before starting any property worker in the disposable test process. */
+__declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only, BOOL pause_first)
+{
+    return install(stock_only, pause_first, FALSE);
+}
+
+__declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM wparam, LPARAM lparam)
+{
+    if (code == HC_ACTION) {
+        const CWPSTRUCT *message = (const CWPSTRUCT *)lparam;
+        if (message->message == RegisterWindowMessageW(L"stdio.shell.stream.lab.2026") &&
+            message->wParam == GetCurrentProcessId() && message->hwnd != GetShellWindow()) {
+            if (message->lParam == 1 || message->lParam == 2) {
+                DWORD result = install(message->lParam == 2, FALSE, TRUE);
+                SetPropW(message->hwnd, L"stdio.lab.install", (HANDLE)((UINT_PTR)result + 1));
+            } else if (message->lParam == 3) {
+                SetPropW(message->hwnd, L"stdio.lab.hits",
+                         (HANDLE)((UINT_PTR)ShellStreamLabHits() + 1));
+            } else if (message->lParam == 4) {
+                InterlockedExchange(&passthrough, TRUE);
+                SetPropW(message->hwnd, L"stdio.lab.disabled", (HANDLE)(UINT_PTR)1);
+            }
+        }
+    }
+    return CallNextHookEx(NULL, code, wparam, lparam);
 }

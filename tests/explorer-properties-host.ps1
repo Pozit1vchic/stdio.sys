@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
-    [switch]$RequireExplorerPatcher
+    [switch]$RequireExplorerPatcher,
+    [string]$LabDll,
+    [switch]$LabPassThrough
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop.
@@ -13,6 +15,58 @@ using System.Runtime.InteropServices;
 
 public static class ExplorerProcessProbe
 {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibrary(string path);
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+    [DllImport("kernel32.dll")]
+    private static extern bool FreeLibrary(IntPtr module);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int kind, IntPtr callback, IntPtr module, uint threadId);
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string name);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr RemoveProp(IntPtr window, string key);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wParam,
+        IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+
+    public static long LabCommand(IntPtr window, uint owner, string path, int command, string reply)
+    {
+        uint actual;
+        uint thread = GetWindowThreadProcessId(window, out actual);
+        if (thread == 0 || actual != owner)
+            throw new InvalidOperationException("Test window changed owner.");
+        IntPtr module = LoadLibrary(path);
+        if (module == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        IntPtr hook = IntPtr.Zero;
+        try {
+            IntPtr callback = GetProcAddress(module, "ShellStreamLabWindowHook");
+            if (callback == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            uint message = RegisterWindowMessage("stdio.shell.stream.lab.2026");
+            RemoveProp(window, reply);
+            hook = SetWindowsHookEx(4, callback, module, thread);
+            if (hook == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            IntPtr ignored;
+            if (SendMessageTimeout(window, message, (IntPtr)owner, (IntPtr)command, 2, 5000,
+                out ignored) == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            IntPtr value = RemoveProp(window, reply);
+            if (value == IntPtr.Zero)
+                throw new InvalidOperationException("The test hook did not return a result.");
+            return value.ToInt64() - 1;
+        } finally {
+            if (hook != IntPtr.Zero)
+                UnhookWindowsHookEx(hook);
+            FreeLibrary(module);
+        }
+    }
+
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
@@ -71,6 +125,8 @@ $shell = New-Object -ComObject Shell.Application
 $any = [Windows.Automation.Condition]::TrueCondition
 $view = $null
 $dialogHandle = [IntPtr]::Zero
+$dll = $null
+$labDirectory = $null
 
 try {
     [void][IO.Directory]::CreateDirectory($child)
@@ -87,6 +143,20 @@ try {
     $explorer = Get-Process -Id $owner
     if ($explorer.Path -ne (Join-Path $env:windir 'explorer.exe')) {
         throw 'The test window does not belong to Windows Explorer.'
+    }
+
+    $window = [IntPtr]$view.HWND
+    if ($LabDll) {
+        $source = (Resolve-Path -LiteralPath $LabDll).ProviderPath
+        # A window host can outlive its last window. Keep the pinned test image
+        # separate from the build output so that it does not block relinking.
+        $labDirectory = Join-Path $parent ('stdio-lab-image-' + [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($labDirectory)
+        $dll = Join-Path $labDirectory 'stdio_shell_lab.dll'
+        [IO.File]::Copy($source, $dll)
+        $command = if ($LabPassThrough) { 2 } else { 1 }
+        $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, $command, 'stdio.lab.install')
+        if ($result) { throw "The Explorer experiment refused to install, Win32 error $result." }
     }
 
     $item = $view.Document.Folder.ParseName($name)
@@ -133,11 +203,12 @@ try {
     $expectedCall = 'E8-D0-AF-1A-00'
     $actualCall = [ExplorerProcessProbe]::ReadCode($owner,
         [IntPtr]::Add($image.BaseAddress, 0x35BF7), 5)
-    if ([BitConverter]::ToString($actualCall) -ne $expectedCall) {
+    if (!$dll -and [BitConverter]::ToString($actualCall) -ne $expectedCall) {
         throw 'The Explorer call no longer targets the expected helper.'
     }
     foreach ($range in @(@{ Name='WalkerCall'; Offset=0x35BF7; Length=12 },
                          @{ Name='StreamHelperEntry'; Offset=0x1E0BCC; Length=32 })) {
+        if ($dll -and $range.Name -eq 'WalkerCall') { continue }
         $stock = [ExplorerProcessProbe]::ReadCode($PID,
             [IntPtr]::Add($local.BaseAddress, $range.Offset), $range.Length)
         $actual = [ExplorerProcessProbe]::ReadCode($owner,
@@ -147,6 +218,40 @@ try {
         }
     }
 
+    $hits = if ($dll) { [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits') } else { 0 }
+    $expectedHits = if ($dll -and !$LabPassThrough) { 1 } else { 0 }
+    if ($hits -ne $expectedHits) { throw "Expected $expectedHits optimized requests, found $hits." }
+    if ($dll) {
+        [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
+        if (![ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
+            throw 'Could not close the first properties dialog.'
+        }
+        [void](Wait-For {
+            $open = $desktop.FindAll('Children', $any) | Where-Object { $_.Current.Name.Contains($name) }
+            !$open
+        } 'The first properties dialog did not close.')
+        $dialogHandle = [IntPtr]::Zero
+        $item.InvokeVerb('properties')
+        $again = Wait-For {
+            $desktop.FindAll('Children', $any) | Where-Object { $_.Current.Name.Contains($name) } |
+                Select-Object -First 1
+        } 'Explorer did not reopen the properties dialog.'
+        $dialogHandle = [IntPtr]$again.Current.NativeWindowHandle
+        if ($again.Current.ProcessId -ne $owner) {
+            throw 'The reopened dialog belongs to a different process.'
+        }
+        [void](Wait-For {
+            $matching = @($again.FindAll('Descendants', $any) | Where-Object {
+                $current = $_.Current
+                $fields.ContainsKey($current.AutomationId) -and
+                    $fields[$current.AutomationId] -eq $current.Name
+            })
+            $matching.Count -eq 3
+        } 'The reopened properties dialog did not return the original values.')
+        $after = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits')
+        if ($after -ne $hits) { throw 'The disabled path still used the stdio implementation.' }
+    }
+
     [pscustomobject]@{
         ExplorerPID = $owner
         ShellVersion = $image.FileVersionInfo.FileVersion
@@ -154,9 +259,15 @@ try {
         Size = $fields['13064']
         SizeOnDisk = $fields['13106']
         Contains = $fields['13087']
-        ComparedCodeBytes = 44
+        ComparedCodeBytes = $(if ($dll) { 32 } else { 44 })
+        OptimizedRequests = $hits
+        VerifiedDisable = [bool]$dll
     }
 } finally {
+    if ($dll -and $view) {
+        try { [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled') }
+        catch { Write-Warning "Could not disable the experimental path: $_" }
+    }
     if ($dialogHandle -ne [IntPtr]::Zero) {
         [void][ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     }
@@ -164,4 +275,14 @@ try {
     [IO.File]::Delete($payload)
     if ([IO.Directory]::Exists($child)) { [IO.Directory]::Delete($child) }
     if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
+    if ($labDirectory) {
+        try {
+            [IO.File]::Delete($dll)
+            [IO.Directory]::Delete($labDirectory)
+        } catch [IO.IOException] {
+            Write-Verbose "Test image is still mapped by the isolated Explorer host: $dll"
+        } catch [UnauthorizedAccessException] {
+            Write-Verbose "Test image is still mapped by the isolated Explorer host: $dll"
+        }
+    }
 }
