@@ -22,6 +22,8 @@ DWORD tree_find(const wchar_t *path, const wchar_t *needle, ULONGLONG *matches);
 typedef DWORD (*TREE_VISITOR)(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry);
 DWORD tree_snapshot(const wchar_t *path, TREE_VISITOR visitor, void *context,
                     ULONGLONG *root_id, TREE_RESULT *result);
+DWORD tree_snapshot_directory(const wchar_t *path, TREE_VISITOR visitor, void *context,
+                              ULONGLONG *root_id, TREE_RESULT *result);
 DWORD storage_workers(const wchar_t *path);
 DWORD storage_info(const wchar_t *path);
 DWORD plain_copy(const wchar_t *source, const wchar_t *destination);

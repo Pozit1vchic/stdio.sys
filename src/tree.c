@@ -40,6 +40,7 @@ typedef struct {
 typedef struct {
     TREE_RESULT *result;
     BOOL remove;
+    BOOL shallow;
     PTP_POOL pool;
     PTP_WORK work;
     DELETE_JOB jobs[DELETE_BATCH_SIZE];
@@ -288,6 +289,8 @@ static void walk_directory(WALK *walk, HANDLE directory, unsigned depth, ULONGLO
             }
         }
         flush_jobs(walk);
+        if (walk->shallow)
+            continue;
         for (entry = (void *)buffer; entry; entry = next_entry(entry)) {
             HANDLE child;
             DWORD error;
@@ -390,7 +393,7 @@ DWORD storage_info(const wchar_t *path)
     return ERROR_SUCCESS;
 }
 
-static DWORD walk_path(const wchar_t *path, BOOL remove, DWORD workers, const wchar_t *needle,
+static DWORD walk_path(const wchar_t *path, BOOL remove, BOOL shallow, DWORD workers, const wchar_t *needle,
                        TREE_VISITOR visitor, void *context, ULONGLONG *root_id,
                        TREE_RESULT *result, ULONGLONG *matches)
 {
@@ -428,6 +431,7 @@ static DWORD walk_path(const wchar_t *path, BOOL remove, DWORD workers, const wc
     }
     walk.result = result;
     walk.remove = remove;
+    walk.shallow = shallow;
     walk.needle = needle;
     walk.visitor = visitor;
     walk.context = context;
@@ -460,20 +464,26 @@ static DWORD walk_path(const wchar_t *path, BOOL remove, DWORD workers, const wc
 
 DWORD tree_run(const wchar_t *path, BOOL remove, DWORD workers, TREE_RESULT *result)
 {
-    return walk_path(path, remove, workers, NULL, NULL, NULL, NULL, result, NULL);
+    return walk_path(path, remove, FALSE, workers, NULL, NULL, NULL, NULL, result, NULL);
 }
 
 DWORD tree_find(const wchar_t *path, const wchar_t *needle, ULONGLONG *matches)
 {
     TREE_RESULT result;
     *matches = 0;
-    return walk_path(path, FALSE, 1, needle, NULL, NULL, NULL, &result, matches);
+    return walk_path(path, FALSE, FALSE, 1, needle, NULL, NULL, NULL, &result, matches);
 }
 
 DWORD tree_snapshot(const wchar_t *path, TREE_VISITOR visitor, void *context,
                     ULONGLONG *root_id, TREE_RESULT *result)
 {
-    return walk_path(path, FALSE, 1, NULL, visitor, context, root_id, result, NULL);
+    return walk_path(path, FALSE, FALSE, 1, NULL, visitor, context, root_id, result, NULL);
+}
+
+DWORD tree_snapshot_directory(const wchar_t *path, TREE_VISITOR visitor, void *context,
+                              ULONGLONG *root_id, TREE_RESULT *result)
+{
+    return walk_path(path, FALSE, TRUE, 1, NULL, visitor, context, root_id, result, NULL);
 }
 
 typedef struct {

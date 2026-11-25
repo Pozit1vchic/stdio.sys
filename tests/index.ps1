@@ -10,6 +10,14 @@ function Assert-Count([string]$Query, [int]$Expected) {
     }
 }
 
+function Assert-Response([string]$Command, [string]$Pattern) {
+    $writer.WriteLine($Command)
+    $line = $process.StandardOutput.ReadLine()
+    if ($line -notmatch $Pattern) {
+        throw "Command '$Command' expected '$Pattern', received '$line'."
+    }
+}
+
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $fixture = Join-Path $parent ('index-test-' + [guid]::NewGuid().ToString('N'))
 $process = $null
@@ -39,6 +47,8 @@ try {
     # Windows PowerShell cannot set ProcessStartInfo.StandardInputEncoding.
     $writer = [IO.StreamWriter]::new($process.StandardInput.BaseStream, [Text.UTF8Encoding]::new($false))
     $writer.AutoFlush = $true
+    Assert-Response 'snapshot-stats' '^full_refreshes=1 refreshed_directories=0$'
+    Assert-Response 'folder-size' '^files=3 directories=3 bytes=27$'
     Assert-Count "name-exact $upper" 2
     Assert-Count "name $upper" 3
     Assert-Count 'name-exact missing.txt' 0
@@ -46,6 +56,23 @@ try {
     [IO.File]::Move($alias, $renamed)
     Assert-Count 'name-exact RENAMED.TXT' 1
     Assert-Count "name-exact $name" 1
+    Assert-Response 'snapshot-stats' '^full_refreshes=1 refreshed_directories=1$'
+    [IO.File]::WriteAllText($renamed, ('x' * 20))
+    Assert-Count 'size 20:20' 2
+    Assert-Response 'folder-size' '^files=3 directories=3 bytes=53$'
+    Assert-Response 'snapshot-stats' '^full_refreshes=1 refreshed_directories=(?:[3-9]|[1-9][0-9]+)$'
+    [IO.File]::Delete($renamed)
+    Assert-Count 'name-exact renamed.txt' 0
+    Assert-Response 'folder-size' '^files=2 directories=3 bytes=33$'
+    [IO.Directory]::Move($left, (Join-Path $fixture 'relocated'))
+    Assert-Count 'path relocated' 1
+    Assert-Count 'path \left\' 0
+    Assert-Response 'snapshot-stats' '^full_refreshes=2 refreshed_directories='
+    for ($i = 0; $i -lt 1500; $i++) {
+        [IO.File]::WriteAllBytes((Join-Path $right ("burst-$i.bin")), [byte[]]@())
+    }
+    Assert-Count 'name burst-' 1500
+    Assert-Response 'snapshot-stats' '^full_refreshes=[3-9] refreshed_directories='
     $writer.WriteLine('quit')
     if (!$process.WaitForExit(5000) -or $process.ExitCode) {
         throw 'The index process did not exit successfully.'

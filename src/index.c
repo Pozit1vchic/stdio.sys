@@ -12,11 +12,16 @@
 #define SEARCH_BATCH_SIZE 512
 #define SEARCH_WORKERS 4
 #define EXACT_INDEX_BYTES (8 * 1024 * 1024)
+#define NOTIFICATION_BYTES (64 * 1024)
+#define MAX_DIRTY_DIRECTORIES 16
 
 typedef struct {
     DWORDLONG id;
     DWORDLONG parent;
-    USN usn;
+    union {
+        USN usn;
+        ULONGLONG size;
+    };
     wchar_t *name;
     DWORD attributes;
     DWORD name_signature;
@@ -44,12 +49,17 @@ typedef struct {
     size_t exact_count;
     BOOL exact_attempted;
     NAME_BLOCK *file_names;
+    size_t file_name_units, stale_name_units;
     BYTE *buffer;
     const wchar_t *prefix;
     const wchar_t *directory;
     const wchar_t *watch_path;
-    HANDLE notification;
+    HANDLE directory_watch;
+    OVERLAPPED notification;
+    BOOL watch_pending;
     DWORDLONG watched_root;
+    DWORD watched_volume;
+    ULONGLONG full_refreshes, refreshed_directories;
     DWORD search_workers;
     TREE_RESULT totals;
 } INDEX;
@@ -108,6 +118,7 @@ static void clear_entries(INDEX *index)
     index->files = NULL;
     index->capacity = index->occupied = index->live = 0;
     index->file_capacity = index->file_count = 0;
+    index->file_name_units = index->stale_name_units = 0;
 }
 
 static DWORD grow_entries(INDEX *index)
@@ -173,7 +184,8 @@ static DWORD update_entry(INDEX *index, DWORDLONG id, DWORDLONG parent, USN usn,
         free(entry->name);
     if (name)
         ++index->live;
-    *entry = (INDEX_ENTRY){ id, parent, usn, name, attributes, signature };
+    *entry = (INDEX_ENTRY){ .id = id, .parent = parent, .usn = usn, .name = name,
+                            .attributes = attributes, .name_signature = signature };
     return ERROR_SUCCESS;
 }
 
@@ -560,17 +572,13 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
     return ERROR_SUCCESS;
 }
 
-static DWORD snapshot_entry(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry)
+static DWORD snapshot_file(INDEX *index, ULONGLONG parent, DWORDLONG id, const FILE_ID_EXTD_DIR_INFO *entry)
 {
-    INDEX *index = context;
-    DWORDLONG id;
     const size_t length = entry->FileNameLength / sizeof(wchar_t);
+    ULONGLONG size = entry->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT ?
+                     0 : (ULONGLONG)entry->EndOfFile.QuadPart;
     NAME_BLOCK *block;
     wchar_t *name;
-    memcpy(&id, entry->FileId.Identifier, sizeof(id));
-    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        return update_entry(index, id, parent, 0, entry->FileAttributes, entry->FileName,
-                            (USHORT)entry->FileNameLength);
     if (index->file_count == index->file_capacity) {
         size_t capacity = index->file_capacity ? index->file_capacity * 2 : 256;
         INDEX_ENTRY *files = capacity <= SIZE_MAX / sizeof(*files) ?
@@ -593,19 +601,32 @@ static DWORD snapshot_entry(void *context, ULONGLONG parent, const FILE_ID_EXTD_
     }
     name = block->text + block->used;
     block->used += length + 1;
+    index->file_name_units += length + 1;
     memcpy(name, entry->FileName, entry->FileNameLength);
     name[length] = 0;
     index->files[index->file_count++] = (INDEX_ENTRY){
-        id, parent, 0, name, entry->FileAttributes, name_signature(name, MAXDWORD)
+        .id = id, .parent = parent, .size = size, .name = name, .attributes = entry->FileAttributes,
+        .name_signature = name_signature(name, MAXDWORD)
     };
     return ERROR_SUCCESS;
 }
 
-static DWORD directory_identity(const wchar_t *path, DWORDLONG *id)
+static DWORD snapshot_entry(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry)
+{
+    INDEX *index = context;
+    DWORDLONG id;
+    memcpy(&id, entry->FileId.Identifier, sizeof(id));
+    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return update_entry(index, id, parent, 0, entry->FileAttributes, entry->FileName,
+                            (USHORT)entry->FileNameLength);
+    return snapshot_file(index, parent, id, entry);
+}
+
+static DWORD directory_identity(const wchar_t *path, DWORDLONG *id, DWORD *serial)
 {
     BY_HANDLE_FILE_INFORMATION information;
     DWORD error = ERROR_SUCCESS;
-    HANDLE handle = CreateFileW(path, FILE_READ_ATTRIBUTES,
+    HANDLE handle = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (handle == INVALID_HANDLE_VALUE)
@@ -617,43 +638,228 @@ static DWORD directory_identity(const wchar_t *path, DWORDLONG *id)
         error = ERROR_DIRECTORY;
     } else {
         *id = ((DWORDLONG)information.nFileIndexHigh << 32) | information.nFileIndexLow;
+        if (serial)
+            *serial = information.dwVolumeSerialNumber;
     }
     CloseHandle(handle);
+    return error;
+}
+
+typedef struct {
+    DWORDLONG directories[MAX_DIRTY_DIRECTORIES];
+    DWORDLONG objects[MAX_DIRTY_DIRECTORIES];
+    size_t directory_count, object_count;
+    BOOL rebuild;
+} DIRECTORY_CHANGES;
+
+static BOOL add_changed_id(DWORDLONG *values, size_t *count, DWORDLONG id)
+{
+    size_t i;
+    for (i = 0; i < *count; ++i) {
+        if (values[i] == id)
+            return TRUE;
+    }
+    if (!id || *count == MAX_DIRTY_DIRECTORIES)
+        return FALSE;
+    values[(*count)++] = id;
+    return TRUE;
+}
+
+static void read_directory_changes(const BYTE *buffer, DWORD bytes, DIRECTORY_CHANGES *changes)
+{
+    const DWORD header = offsetof(FILE_NOTIFY_EXTENDED_INFORMATION, FileName);
+    DWORD offset = 0;
+    while (bytes - offset >= header) {
+        FILE_NOTIFY_EXTENDED_INFORMATION record;
+        memcpy(&record, buffer + offset, header);
+        const DWORD remaining = bytes - offset;
+        const DWORD length = record.NextEntryOffset ? record.NextEntryOffset : remaining;
+        if (length < header || length > remaining || !record.FileNameLength ||
+            (record.FileNameLength % sizeof(wchar_t)) || record.FileNameLength > length - header ||
+            record.Action < FILE_ACTION_ADDED || record.Action > FILE_ACTION_RENAMED_NEW_NAME ||
+            (record.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+            !add_changed_id(changes->directories, &changes->directory_count, record.ParentFileId.QuadPart) ||
+            (record.Action == FILE_ACTION_MODIFIED &&
+             !add_changed_id(changes->objects, &changes->object_count, record.FileId.QuadPart)))
+            break;
+        if (!record.NextEntryOffset)
+            return;
+        offset += length;
+    }
+    changes->rebuild = TRUE;
+}
+
+static DWORD arm_directory_watch(INDEX *index)
+{
+    HANDLE event = index->notification.hEvent;
+    ZeroMemory(&index->notification, sizeof(index->notification));
+    index->notification.hEvent = event;
+    if (!ResetEvent(event) ||
+        !ReadDirectoryChangesExW(index->directory_watch, index->buffer, NOTIFICATION_BYTES, TRUE,
+                                 FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                 FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE |
+                                 FILE_NOTIFY_CHANGE_SECURITY,
+                                 NULL, &index->notification, NULL, ReadDirectoryNotifyExtendedInformation))
+        return GetLastError();
+    index->watch_pending = TRUE;
+    return ERROR_SUCCESS;
+}
+
+static DWORD finish_watch_read(INDEX *index, DIRECTORY_CHANGES *changes)
+{
+    DWORD bytes, error = ERROR_SUCCESS;
+    if (!GetOverlappedResult(index->directory_watch, &index->notification, &bytes, FALSE)) {
+        error = GetLastError();
+        if (error == ERROR_IO_INCOMPLETE)
+            return error;
+    }
+    index->watch_pending = FALSE;
+    if (error && error != ERROR_NOTIFY_ENUM_DIR)
+        return error;
+    if (error || bytes > NOTIFICATION_BYTES)
+        changes->rebuild = TRUE;
+    else
+        read_directory_changes(index->buffer, bytes, changes);
+    return arm_directory_watch(index);
+}
+
+typedef struct {
+    INDEX *index;
+    size_t directories_seen;
+} DIRECTORY_REFRESH;
+
+static DWORD refresh_child_entry(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry)
+{
+    DIRECTORY_REFRESH *update = context;
+    INDEX *index = update->index;
+    DWORDLONG id;
+    memcpy(&id, entry->FileId.Identifier, sizeof(id));
+    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        const INDEX_ENTRY *previous;
+        if (!index->capacity)
+            return ERROR_RETRY;
+        previous = &index->entries[entry_slot(index->entries, index->capacity, id)];
+        if (!previous->name || previous->parent != parent || previous->attributes != entry->FileAttributes ||
+            wcslen(previous->name) * sizeof(wchar_t) != entry->FileNameLength ||
+            memcmp(previous->name, entry->FileName, entry->FileNameLength))
+            return ERROR_RETRY;
+        ++update->directories_seen;
+        return ERROR_SUCCESS;
+    }
+    return snapshot_file(index, parent, id, entry);
+}
+
+static DWORD refresh_files_in_directory(INDEX *index, DWORDLONG id, wchar_t *path_buffer)
+{
+    DIRECTORY_REFRESH update = { .index = index };
+    size_t before = index->file_count, known_directories = 0, read, write = 0;
+    const wchar_t *path = index->directory;
+    DWORDLONG actual_id;
+    TREE_RESULT totals;
+    DWORD error;
+    if (id != index->root) {
+        const INDEX_ENTRY *entry;
+        if (!index->capacity)
+            return ERROR_RETRY;
+        entry = &index->entries[entry_slot(index->entries, index->capacity, id)];
+        if ((entry->attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+            FILE_ATTRIBUTE_DIRECTORY)
+            return ERROR_RETRY;
+        path = entry_path(index, entry, path_buffer);
+        if (!path)
+            return ERROR_RETRY;
+        path += 4;
+    }
+    for (read = 0; read < index->capacity; ++read) {
+        if (index->entries[read].name && index->entries[read].parent == id)
+            ++known_directories;
+    }
+    error = tree_snapshot_directory(path, refresh_child_entry, &update, &actual_id, &totals);
+    if (error || actual_id != id || update.directories_seen != known_directories)
+        return ERROR_RETRY;
+    for (read = 0; read < before; ++read) {
+        INDEX_ENTRY *entry = &index->files[read];
+        if (entry->parent == id) {
+            --index->totals.files;
+            index->totals.bytes -= entry->size;
+            index->stale_name_units += wcslen(entry->name) + 1;
+        } else {
+            if (write != read)
+                index->files[write] = *entry;
+            ++write;
+        }
+    }
+    index->totals.files += index->file_count - before;
+    index->totals.bytes += totals.bytes;
+    if (write != before)
+        memmove(index->files + write, index->files + before, (index->file_count - before) * sizeof(*index->files));
+    index->file_count = write + index->file_count - before;
+    return ERROR_SUCCESS;
+}
+
+static DWORD refresh_changed_directories(INDEX *index, DIRECTORY_CHANGES *changes)
+{
+    wchar_t *path;
+    size_t i, j;
+    DWORD error = ERROR_SUCCESS;
+    if (!index->live || index->stale_name_units >=
+        max(NAME_BLOCK_UNITS, (index->file_name_units - index->stale_name_units) / 4))
+        return ERROR_RETRY;
+    /* A size change through one hardlink also affects its other names in the snapshot. */
+    for (i = 0; changes->object_count && i < index->file_count; ++i) {
+        for (j = 0; j < changes->object_count; ++j) {
+            if (index->files[i].id == changes->objects[j] &&
+                !add_changed_id(changes->directories, &changes->directory_count, index->files[i].parent))
+                return ERROR_RETRY;
+        }
+    }
+    path = malloc(PATH_CHARS * sizeof(*path));
+    if (!path)
+        return ERROR_RETRY;
+    clear_exact_names(index);
+    for (i = 0; i < changes->directory_count && !error; ++i) {
+        error = refresh_files_in_directory(index, changes->directories[i], path);
+        if (!error)
+            ++index->refreshed_directories;
+    }
+    free(path);
     return error;
 }
 
 static DWORD snapshot_refresh(INDEX *index, BOOL initial)
 {
     unsigned attempt;
-    DWORDLONG current_id = 0;
-    DWORD identity_error = directory_identity(index->watch_path, &current_id);
-    if (identity_error)
-        return identity_error;
-    if (current_id != index->watched_root)
+    DWORDLONG current_id;
+    DWORD current_volume;
+    DWORD error = directory_identity(index->watch_path, &current_id, &current_volume);
+    if (error)
+        return error;
+    if (current_id != index->watched_root || current_volume != index->watched_volume)
         return ERROR_RETRY;
     for (attempt = 0; attempt < 3; ++attempt) {
-        DWORD state = WaitForSingleObject(index->notification, 0);
-        DWORD error;
+        DIRECTORY_CHANGES changes = {0};
+        DWORD state = WaitForSingleObject(index->notification.hEvent, 0);
         if (state == WAIT_FAILED)
             return GetLastError();
-        if (state == WAIT_OBJECT_0 && !FindNextChangeNotification(index->notification))
-            return GetLastError();
-        if (!initial && state == WAIT_TIMEOUT)
+        if (state == WAIT_OBJECT_0) {
+            error = finish_watch_read(index, &changes);
+            if (error)
+                return error;
+        } else if (!initial) {
             return ERROR_SUCCESS;
-        clear_entries(index);
-        error = tree_snapshot(index->directory, snapshot_entry, index, &index->root, &index->totals);
-        if (error)
-            return error;
-        if (index->root != index->watched_root)
-            return ERROR_RETRY;
-        state = WaitForSingleObject(index->notification, 0);
-        if (state == WAIT_TIMEOUT)
-            return ERROR_SUCCESS;
-        if (state == WAIT_FAILED)
-            return GetLastError();
-        initial = TRUE;
+        }
+        if (initial || changes.rebuild || refresh_changed_directories(index, &changes)) {
+            clear_entries(index);
+            error = tree_snapshot(index->directory, snapshot_entry, index, &index->root, &index->totals);
+            if (error)
+                return error;
+            if (index->root != index->watched_root)
+                return ERROR_RETRY;
+            ++index->full_refreshes;
+        }
+        initial = FALSE;
     }
-    return ERROR_BUSY;
+    return WaitForSingleObject(index->notification.hEvent, 0) == WAIT_TIMEOUT ? ERROR_SUCCESS : ERROR_BUSY;
 }
 
 static DWORD commands(INDEX *index, const wchar_t *storage_path)
@@ -671,12 +877,12 @@ static DWORD commands(INDEX *index, const wchar_t *storage_path)
                 (double)(end.QuadPart - start.QuadPart) / (double)frequency.QuadPart);
         fwprintf(stderr, L"name TEXT | name-exact NAME | ext EXT | path TEXT | size MIN:MAX | "
                  L"count MODE VALUE | %lsquit\n",
-                 index->directory ? L"folder-size | " : L"");
+                 index->directory ? L"folder-size | snapshot-stats | " : L"");
         fflush(stdout);
     }
     while (!error && fgetws(input, ARRAYSIZE(input), stdin)) {
         wchar_t *value, *mode = input;
-        BOOL count_only = FALSE, folder_size;
+        BOOL count_only = FALSE, folder_size, snapshot_stats;
         size_t length = wcscspn(input, L"\r\n");
         if (!input[length] && length == ARRAYSIZE(input) - 1) {
             wint_t c;
@@ -694,10 +900,11 @@ static DWORD commands(INDEX *index, const wchar_t *storage_path)
             mode += 6;
         }
         folder_size = index->directory && !count_only && !wcscmp(mode, L"folder-size");
+        snapshot_stats = index->directory && !count_only && !wcscmp(mode, L"snapshot-stats");
         value = wcschr(mode, L' ');
         if (value) {
             *value++ = 0;
-        } else if (!folder_size) {
+        } else if (!folder_size && !snapshot_stats) {
             print_error(L"query", ERROR_INVALID_PARAMETER);
             continue;
         }
@@ -716,6 +923,9 @@ static DWORD commands(INDEX *index, const wchar_t *storage_path)
                 const TREE_RESULT *totals = &index->totals;
                 wprintf(L"files=%llu directories=%llu bytes=%llu\n", totals->files,
                         totals->directories, totals->bytes);
+            } else if (snapshot_stats) {
+                wprintf(L"full_refreshes=%llu refreshed_directories=%llu\n",
+                        index->full_refreshes, index->refreshed_directories);
             } else {
                 DWORD query_error = search(index, mode, value, count_only);
                 if (query_error)
@@ -729,8 +939,10 @@ static DWORD commands(INDEX *index, const wchar_t *storage_path)
 
 DWORD directory_index_console(const wchar_t *input)
 {
-    INDEX index = {0};
+    INDEX index = { .directory_watch = INVALID_HANDLE_VALUE };
     wchar_t *path = malloc(PATH_CHARS * sizeof(*path));
+    wchar_t *prefix = NULL;
+    BY_HANDLE_FILE_INFORMATION identity;
     DWORD length, error;
     if (!path)
         return ERROR_NOT_ENOUGH_MEMORY;
@@ -738,37 +950,60 @@ DWORD directory_index_console(const wchar_t *input)
     length = GetFullPathNameW(input, PATH_CHARS - 4, path + 4, NULL);
     if (!length || length >= PATH_CHARS - 4 || length < 3 || path[5] != L':' || path[6] != L'\\') {
         error = length ? ERROR_INVALID_NAME : GetLastError();
-    } else {
-        while (length > 3 && path[length + 3] == L'\\')
-            path[--length + 4] = 0;
-        index.directory = path + 4;
-        index.watch_path = path;
-        error = directory_identity(path, &index.watched_root);
-        if (error) {
-            free(path);
-            return error;
-        }
-        index.notification = FindFirstChangeNotificationW(path, TRUE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES |
-            FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_SECURITY);
-        if (index.notification == INVALID_HANDLE_VALUE) {
-            error = GetLastError();
-        } else {
-            /* Keep the drive root valid for traversal and omit its slash only in joined paths. */
-            wchar_t *prefix = _wcsdup(path);
-            if (!prefix) {
-                error = ERROR_NOT_ENOUGH_MEMORY;
-            } else {
-                while (length > 2 && prefix[length + 3] == L'\\')
-                    prefix[--length + 4] = 0;
-                index.prefix = prefix;
-                error = commands(&index, index.directory);
-                free(prefix);
-            }
-            FindCloseChangeNotification(index.notification);
-        }
+        goto done;
     }
+    while (length > 3 && path[length + 3] == L'\\')
+        path[--length + 4] = 0;
+    index.directory = path + 4;
+    index.watch_path = path;
+    error = directory_identity(path, &index.watched_root, &index.watched_volume);
+    if (error)
+        goto done;
+    index.directory_watch = CreateFileW(path, FILE_LIST_DIRECTORY,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
+                                        FILE_FLAG_OVERLAPPED, NULL);
+    if (index.directory_watch == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(index.directory_watch, &identity)) {
+        error = GetLastError();
+        goto done;
+    }
+    if ((((DWORDLONG)identity.nFileIndexHigh << 32) | identity.nFileIndexLow) != index.watched_root ||
+        identity.dwVolumeSerialNumber != index.watched_volume) {
+        error = ERROR_RETRY;
+        goto done;
+    }
+    index.notification.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!index.notification.hEvent) {
+        error = GetLastError();
+        goto done;
+    }
+    prefix = _wcsdup(path);
+    index.buffer = malloc(NOTIFICATION_BYTES);
+    if (!prefix || !index.buffer) {
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
+    }
+    /* Omit the drive root's trailing slash when composing paths. */
+    if (length == 3)
+        prefix[6] = 0;
+    index.prefix = prefix;
+    error = arm_directory_watch(&index);
+    if (!error)
+        error = commands(&index, index.directory);
+done:
+    if (index.watch_pending) {
+        DWORD bytes;
+        CancelIoEx(index.directory_watch, &index.notification);
+        GetOverlappedResult(index.directory_watch, &index.notification, &bytes, TRUE);
+    }
+    if (index.directory_watch != INVALID_HANDLE_VALUE)
+        CloseHandle(index.directory_watch);
+    if (index.notification.hEvent)
+        CloseHandle(index.notification.hEvent);
     clear_entries(&index);
+    free(index.buffer);
+    free(prefix);
     free(path);
     return error;
 }
@@ -789,7 +1024,7 @@ DWORD index_console(const wchar_t *drive)
         return GetLastError();
     if (_wcsicmp(fs, L"NTFS"))
         return ERROR_NOT_SUPPORTED;
-    error = directory_identity(root, &index.root);
+    error = directory_identity(root, &index.root, NULL);
     if (error)
         return error;
     index.volume = CreateFileW(device, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
