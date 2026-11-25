@@ -569,10 +569,11 @@ DWORD tree_list(const wchar_t *path)
     return error;
 }
 
-DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode)
+static DWORD copy_file_with_flags(const wchar_t *source, const wchar_t *destination,
+                                 STDIO_COPY_MODE mode, DWORD flags)
 {
     COPYFILE2_EXTENDED_PARAMETERS options = {
-        sizeof(options), COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK, NULL, NULL, NULL
+        sizeof(options), COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK | flags, NULL, NULL, NULL
     };
     HRESULT result;
     if (mode == STDIO_COPY_UNBUFFERED)
@@ -582,6 +583,22 @@ DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_CO
     result = CopyFile2(source, destination, &options);
     return FAILED(result) ? (HRESULT_FACILITY(result) == FACILITY_WIN32 ?
                             HRESULT_CODE(result) : (DWORD)result) : ERROR_SUCCESS;
+}
+
+DWORD copy_file_mode(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode)
+{
+    DWORD attributes = GetFileAttributesW(source);
+    DWORD flags = 0;
+    if (attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_REPARSE_POINT)) == FILE_ATTRIBUTE_SPARSE_FILE) {
+        wchar_t root[MAX_PATH];
+        DWORD capabilities;
+        if (GetVolumePathNameW(destination, root, ARRAYSIZE(root)) &&
+            GetVolumeInformationW(root, NULL, 0, NULL, NULL, &capabilities, NULL, 0) &&
+            (capabilities & FILE_SUPPORTS_SPARSE_FILES))
+            flags = COPY_FILE_ENABLE_SPARSE_COPY;
+    }
+    return copy_file_with_flags(source, destination, mode, flags);
 }
 
 DWORD plain_copy(const wchar_t *source, const wchar_t *destination)
@@ -713,6 +730,9 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
             if (!error) {
                 error = portable_file_check(batch, entry, pinned);
                 if (!error) {
+                    DWORD flags = (entry->FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) &&
+                                  (batch->target_flags & FILE_SUPPORTS_SPARSE_FILES) ?
+                                  COPY_FILE_ENABLE_SPARSE_COPY : 0;
                     BOOL unbuffered = batch->unbuffered_large &&
                                       (ULONGLONG)entry->EndOfFile.QuadPart >= LARGE_COPY_BYTES &&
                                       !(entry->FileAttributes & (FILE_ATTRIBUTE_COMPRESSED |
@@ -721,8 +741,9 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
                     source[batch->source_length + length] = 0;
                     memcpy(target + batch->target_length, entry->FileName, entry->FileNameLength);
                     target[batch->target_length + length] = 0;
-                    error = copy_file_mode(source, target,
-                                           unbuffered ? STDIO_COPY_UNBUFFERED : STDIO_COPY_BUFFERED);
+                    error = copy_file_with_flags(source, target,
+                                                 unbuffered ? STDIO_COPY_UNBUFFERED : STDIO_COPY_BUFFERED,
+                                                 flags);
                 }
                 CloseHandle(pinned);
             }

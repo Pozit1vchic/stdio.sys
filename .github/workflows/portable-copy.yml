@@ -74,6 +74,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'NTFS to exFAT small tree copy failed' }
             & $cli bench-copy (Join-Path $exfatSmall 'note.txt') (Join-Path $work.FullName 'exfat-small-return.bin')
             if ($LASTEXITCODE -ne 0) { throw 'Benchmark could not open a small exFAT source' }
+            $sparse = Join-Path $work.FullName 'sparse.bin'
+            [IO.File]::WriteAllBytes($sparse, [byte[]]@())
+            & fsutil.exe sparse setflag $sparse
+            if ($LASTEXITCODE -ne 0) { throw 'Could not prepare sparse NTFS fixture' }
+            $stream = [IO.File]::Open($sparse, 'Open', 'Write', 'None')
+            try {
+              $stream.Position = 4MB
+              $stream.WriteByte(123)
+            } finally { $stream.Dispose() }
+            $dense = Join-Path $exfatRoot 'dense.bin'
+            & $cli bench-copy $sparse $dense
+            if ($LASTEXITCODE -ne 0 -or ((Get-Item -LiteralPath $dense).Attributes -band [IO.FileAttributes]::SparseFile)) {
+              throw 'exFAT copy did not preserve the contents of a sparse source'
+            }
+            Write-Output 'exfat_sparse_source_dense_copy=passed'
             Set-Content -LiteralPath $smallFile -Stream 'stdio-meta' -Value 'metadata' -NoNewline
             foreach ($root in @($fatRoot, $exfatRoot)) {
               $destination = Join-Path $root 'named-stream-rejected'

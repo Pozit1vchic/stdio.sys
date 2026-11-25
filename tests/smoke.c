@@ -1,5 +1,6 @@
 #define COBJMACROS
 #include <shlobj.h>
+#include <winioctl.h>
 #include <wchar.h>
 #include "../src/engine.h"
 
@@ -12,6 +13,33 @@ static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
         return FALSE;
     ok = WriteFile(file, data, length, &written, NULL) && written == length;
     return CloseHandle(file) && ok;
+}
+
+static BOOL sparse_copy_test(const wchar_t *root, const wchar_t *tree_copy)
+{
+    wchar_t source[MAX_PATH], direct[MAX_PATH], nested[MAX_PATH];
+    LARGE_INTEGER tail = { .QuadPart = 4 * 1024 * 1024 };
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    HANDLE file;
+    DWORD bytes;
+    TREE_RESULT result;
+    BOOL prepared;
+    swprintf_s(source, ARRAYSIZE(source), L"%ls\\sparse.bin", root);
+    swprintf_s(direct, ARRAYSIZE(direct), L"%ls\\sparse-copy.bin", root);
+    swprintf_s(nested, ARRAYSIZE(nested), L"%ls\\sparse.bin", tree_copy);
+    file = CreateFileW(source, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return FALSE;
+    prepared = DeviceIoControl(file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &bytes, NULL) &&
+               SetFilePointerEx(file, tail, NULL, FILE_BEGIN) &&
+               WriteFile(file, "end", 3, &bytes, NULL) && bytes == 3;
+    CloseHandle(file);
+    return prepared && !plain_copy(source, direct) &&
+           GetFileAttributesExW(direct, GetFileExInfoStandard, &info) &&
+           (info.dwFileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) && info.nFileSizeLow == tail.LowPart + 3 &&
+           !copy_new_tree(root, tree_copy, 4, FALSE, &result) &&
+           GetFileAttributesExW(nested, GetFileExInfoStandard, &info) &&
+           (info.dwFileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) && info.nFileSizeLow == tail.LowPart + 3;
 }
 
 static HRESULT test_command(const wchar_t *dll, const wchar_t *path)
@@ -149,6 +177,10 @@ int wmain(int argc, wchar_t **argv)
     lock = INVALID_HANDLE_VALUE;
     if (tree_run(tree_copy, TRUE, 4, &result)) {
         fputws(L"Tree copy cleanup failed.\n", stderr);
+        goto cleanup;
+    }
+    if (!sparse_copy_test(root, tree_copy) || tree_run(tree_copy, TRUE, 4, &result)) {
+        fputws(L"Sparse file copy failed.\n", stderr);
         goto cleanup;
     }
     lock = CreateFileW(copy, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
