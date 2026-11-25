@@ -290,16 +290,36 @@ static DWORD rebuild(INDEX *index)
     return refresh(index);
 }
 
-static const wchar_t *entry_path(const INDEX *index, const INDEX_ENTRY *entry, wchar_t *buffer)
+typedef struct {
+    ULONGLONG parent;
+    size_t length;
+    wchar_t path[1024];
+} PARENT_PATH;
+
+static const wchar_t *entry_path_cached(const INDEX *index, const INDEX_ENTRY *entry,
+                                       wchar_t *buffer, PARENT_PATH *cache)
 {
     wchar_t *start = buffer + PATH_CHARS - 1;
     size_t depth = 0, prefix_length = wcslen(index->prefix);
+    size_t name_length;
+    ULONGLONG parent = entry->parent;
+    if (!entry->name)
+        return NULL;
+    name_length = wcslen(entry->name);
+    if (cache && cache->length && cache->parent == parent) {
+        if (cache->length + 1 + name_length >= PATH_CHARS)
+            return NULL;
+        memcpy(buffer, cache->path, cache->length * sizeof(*buffer));
+        buffer[cache->length] = L'\\';
+        memcpy(buffer + cache->length + 1, entry->name, (name_length + 1) * sizeof(*buffer));
+        return buffer;
+    }
     *start = 0;
     for (;;) {
         size_t length;
         if (!entry->name || ++depth > PATH_CHARS / 2)
             return NULL;
-        length = wcslen(entry->name);
+        length = depth == 1 ? name_length : wcslen(entry->name);
         if ((size_t)(start - buffer) < length + 1 + prefix_length)
             return NULL;
         start -= length;
@@ -314,7 +334,20 @@ static const wchar_t *entry_path(const INDEX *index, const INDEX_ENTRY *entry, w
     }
     start -= prefix_length;
     memcpy(start, index->prefix, prefix_length * sizeof(*start));
+    if (cache) {
+        size_t length = (size_t)(buffer + PATH_CHARS - 1 - start) - name_length - 1;
+        if (length <= ARRAYSIZE(cache->path)) {
+            memcpy(cache->path, start, length * sizeof(*start));
+            cache->parent = parent;
+            cache->length = length;
+        }
+    }
     return start;
+}
+
+static const wchar_t *entry_path(const INDEX *index, const INDEX_ENTRY *entry, wchar_t *buffer)
+{
+    return entry_path_cached(index, entry, buffer, NULL);
 }
 
 static BOOL contains(const wchar_t *value, const wchar_t *needle)
@@ -356,9 +389,9 @@ typedef struct {
 } SEARCH_QUERY;
 
 static const wchar_t *lookup_match(const SEARCH_QUERY *query, const INDEX_ENTRY *entry,
-                                   wchar_t *buffer, ULONGLONG *size)
+                                   wchar_t *buffer, PARENT_PATH *cache, ULONGLONG *size)
 {
-    const wchar_t *path = entry_path(query->index, entry, buffer);
+    const wchar_t *path = entry_path_cached(query->index, entry, buffer, cache);
     if (!path || (query->path_needle && !contains(path + 4, query->path_needle)) ||
         !verify_match(entry, path, query->low, query->high, size))
         return NULL;
@@ -370,6 +403,7 @@ typedef struct {
     const INDEX_ENTRY *const *entries;
     size_t count, matches;
     wchar_t *path;
+    PARENT_PATH parent_path;
     PTP_WORK work;
 } SEARCH_WORKER;
 
@@ -382,7 +416,7 @@ static VOID CALLBACK count_matches(PTP_CALLBACK_INSTANCE instance, PVOID context
     worker->matches = 0;
     for (i = 0; i < worker->count; ++i) {
         ULONGLONG size;
-        if (lookup_match(worker->query, worker->entries[i], worker->path, &size))
+        if (lookup_match(worker->query, worker->entries[i], worker->path, &worker->parent_path, &size))
             ++worker->matches;
     }
 }
@@ -551,7 +585,7 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
             }
             continue;
         }
-        path = lookup_match(&query, entry, path_buffer, &size);
+        path = lookup_match(&query, entry, path_buffer, &workers[0].parent_path, &size);
         if (!path)
             continue;
         ++matches;

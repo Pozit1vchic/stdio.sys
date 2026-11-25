@@ -72,6 +72,8 @@ try {
         [IO.File]::WriteAllBytes((Join-Path $right ("burst-$i.bin")), [byte[]]@())
     }
     Assert-Count 'name burst-' 1500
+    Assert-Count 'path \right\burst-' 1500
+    Assert-Count 'path \relocated\burst-' 0
     Assert-Response 'snapshot-stats' '^full_refreshes=[3-9] refreshed_directories='
     $writer.WriteLine('quit')
     if (!$process.WaitForExit(5000) -or $process.ExitCode) {
