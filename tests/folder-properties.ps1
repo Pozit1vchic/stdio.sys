@@ -3,7 +3,8 @@ param(
     [string]$Tool,
     [string]$LabDll,
     [switch]$LabPassThrough,
-    [switch]$CheckCancellation
+    [switch]$CheckCancellation,
+    [string]$CompareWalkDll
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop on local NTFS.
@@ -18,6 +19,19 @@ using System.Threading;
 
 public static class FolderPropertiesProbe
 {
+    [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
+    public delegate uint CompareWalk(string path, out ulong files, out ulong folders, out ulong bytes);
+
+    public static CompareWalk LoadWalk(string path)
+    {
+        var module = LoadLibrary(path);
+        if (module == IntPtr.Zero)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        var entry = GetProcAddress(module, "ShellFolderWalkCompare");
+        if (entry == IntPtr.Zero)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return Marshal.GetDelegateForFunctionPointer<CompareWalk>(entry);
+    }
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     public delegate uint InstallLab(bool stockOnly, bool pauseFirst);
 
@@ -183,6 +197,10 @@ function Read-ByteCount([string]$Text) {
 
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $lab = $null
+$walk = $null
+if ($CompareWalkDll) {
+    $walk = [FolderPropertiesProbe]::LoadWalk((Resolve-Path -LiteralPath $CompareWalkDll).ProviderPath)
+}
 if ($CheckCancellation -and !$LabDll) { throw 'Cancellation instrumentation requires -LabDll.' }
 if ($LabDll) {
     $lab = [FolderPropertiesProbe]::StartLab((Resolve-Path -LiteralPath $LabDll).ProviderPath,
@@ -270,6 +288,29 @@ foreach ($case in $cases) {
         if ($hits -ne $expectedHits) {
             throw "Unexpected number of optimized requests for ${case}: $hits"
         }
+        $walkMs = $null
+        $walkError = $null
+        if ($walk) {
+            [uint64]$walkFiles = [uint64]::MaxValue
+            [uint64]$walkFolders = [uint64]::MaxValue
+            [uint64]$walkBytes = [uint64]::MaxValue
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $walkError = $walk.Invoke($path, [ref]$walkFiles, [ref]$walkFolders, [ref]$walkBytes)
+            $walkMs = $clock.Elapsed.TotalMilliseconds
+            $expectedError = switch ($case) {
+                junction { 50 }
+                accessDenied { 5 }
+                default { 0 }
+            }
+            if ($walkError -ne $expectedError) { throw "Unexpected walk status for ${case}: $walkError" }
+            if (!$walkError -and ($walkFiles -ne $expectedFiles -or $walkFolders -ne 1 -or $walkBytes -ne $logical)) {
+                throw "Recursive walk disagreed with Shell for $case."
+            }
+            if ($walkError -and ($walkFiles -ne [uint64]::MaxValue -or
+                $walkFolders -ne [uint64]::MaxValue -or $walkBytes -ne [uint64]::MaxValue)) {
+                throw "Recursive walk returned partial totals for $case."
+            }
+        }
         switch ($case) {
             plain { $ordinaryAllocation = $allocated }
             fileStream {
@@ -299,6 +340,8 @@ foreach ($case in $cases) {
             ShellContains = $fields[13087]
             Engine = $engine
             OptimizedRequests = $hits
+            WalkError = $walkError
+            WalkMilliseconds = $walkMs
         }
     } finally {
         if ($originalAcl) { Set-Acl -LiteralPath $nested -AclObject $originalAcl }
