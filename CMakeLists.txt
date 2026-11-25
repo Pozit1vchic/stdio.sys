@@ -30,4 +30,8 @@ if(BUILD_TESTING)
     add_executable(stdio_smoke tests/smoke.c)
     target_link_libraries(stdio_smoke PRIVATE engine)
     add_test(NAME stdio.smoke COMMAND stdio_smoke "$<TARGET_FILE:stdio_extension>")
+    add_test(NAME stdio.index COMMAND powershell.exe -NoLogo -NoProfile -NonInteractive
+             -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/index.ps1"
+             "$<TARGET_FILE:stdioctl>" "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(stdio.index PROPERTIES TIMEOUT 30)
 endif()

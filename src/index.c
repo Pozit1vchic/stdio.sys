@@ -11,6 +11,7 @@
 #define NAME_BLOCK_UNITS (32 * 1024)
 #define SEARCH_BATCH_SIZE 512
 #define SEARCH_WORKERS 4
+#define EXACT_INDEX_BYTES (8 * 1024 * 1024)
 
 typedef struct {
     DWORDLONG id;
@@ -39,6 +40,9 @@ typedef struct {
     INDEX_ENTRY *files;
     size_t file_capacity;
     size_t file_count;
+    const INDEX_ENTRY **exact_names;
+    size_t exact_count;
+    BOOL exact_attempted;
     NAME_BLOCK *file_names;
     BYTE *buffer;
     const wchar_t *prefix;
@@ -79,9 +83,18 @@ static size_t entry_slot(const INDEX_ENTRY *entries, size_t capacity, DWORDLONG 
     return slot;
 }
 
+static void clear_exact_names(INDEX *index)
+{
+    free(index->exact_names);
+    index->exact_names = NULL;
+    index->exact_count = 0;
+    index->exact_attempted = FALSE;
+}
+
 static void clear_entries(INDEX *index)
 {
     size_t i;
+    clear_exact_names(index);
     for (i = 0; i < index->capacity; ++i)
         free(index->entries[i].name);
     while (index->file_names) {
@@ -106,6 +119,7 @@ static DWORD grow_entries(INDEX *index)
     entries = calloc(capacity, sizeof(*entries));
     if (!entries)
         return ERROR_NOT_ENOUGH_MEMORY;
+    clear_exact_names(index);
     for (i = 0; i < index->capacity; ++i) {
         INDEX_ENTRY *entry = &index->entries[i];
         if (entry->id)
@@ -152,6 +166,9 @@ static DWORD update_entry(INDEX *index, DWORDLONG id, DWORDLONG parent, USN usn,
         ++index->occupied;
     if (entry->name)
         --index->live;
+    if (index->exact_attempted &&
+        (name != entry->name || ((attributes ^ entry->attributes) & FILE_ATTRIBUTE_DIRECTORY)))
+        clear_exact_names(index);
     if (entry->name != name)
         free(entry->name);
     if (name)
@@ -397,10 +414,49 @@ static DWORD number(const wchar_t *value, ULONGLONG *out, wchar_t **end)
     return errno ? ERROR_INVALID_PARAMETER : ERROR_SUCCESS;
 }
 
+static int compare_exact_names(const void *left, const void *right)
+{
+    const INDEX_ENTRY *const *first = left, *const *second = right;
+    return CompareStringOrdinal((*first)->name, -1, (*second)->name, -1, TRUE) - CSTR_EQUAL;
+}
+
+static void build_exact_names(INDEX *index, const INDEX_ENTRY *entries, size_t count)
+{
+    const size_t maximum = index->directory ? index->file_count : index->live;
+    size_t i;
+    if (index->exact_attempted)
+        return;
+    index->exact_attempted = TRUE;
+    if (!maximum || maximum > EXACT_INDEX_BYTES / sizeof(*index->exact_names))
+        return;
+    index->exact_names = malloc(maximum * sizeof(*index->exact_names));
+    if (!index->exact_names)
+        return;
+    for (i = 0; i < count; ++i) {
+        if (entries[i].name && !(entries[i].attributes & FILE_ATTRIBUTE_DIRECTORY))
+            index->exact_names[index->exact_count++] = &entries[i];
+    }
+    qsort(index->exact_names, index->exact_count, sizeof(*index->exact_names), compare_exact_names);
+}
+
+static size_t exact_name_bound(const INDEX *index, const wchar_t *name, BOOL upper)
+{
+    size_t first = 0, end = index->exact_count;
+    while (first < end) {
+        size_t middle = first + (end - first) / 2;
+        int order = CompareStringOrdinal(index->exact_names[middle]->name, -1, name, -1, TRUE);
+        if (order == CSTR_LESS_THAN || (upper && order == CSTR_EQUAL))
+            first = middle + 1;
+        else
+            end = middle;
+    }
+    return first;
+}
+
 static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only)
 {
     WCHAR *path_buffer;
-    size_t i, matches = 0;
+    size_t i, first = 0, matches = 0;
     size_t count = index->directory ? index->file_count : index->capacity;
     const INDEX_ENTRY *entries = index->directory ? index->files : index->entries;
     const INDEX_ENTRY *pending[SEARCH_BATCH_SIZE];
@@ -411,6 +467,8 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
     BOOL pool_attempted = FALSE;
     BOOL by_size = !wcscmp(mode, L"size"), by_path = !wcscmp(mode, L"path");
     BOOL by_ext = !wcscmp(mode, L"ext");
+    BOOL by_exact = !wcscmp(mode, L"name-exact");
+    BOOL exact_sorted = FALSE;
     SEARCH_QUERY query = { index, by_path ? value : NULL, 0, MAXULONGLONG };
     DWORD required = 0;
     LARGE_INTEGER start, end, frequency;
@@ -421,9 +479,9 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
         if (number(value, &query.low, &end_value) || *end_value != L':' ||
             number(end_value + 1, &query.high, &end_value) || *end_value || query.low > query.high)
             return ERROR_INVALID_PARAMETER;
-    } else if (!by_ext && !by_path && wcscmp(mode, L"name")) {
+    } else if (!by_ext && !by_path && !by_exact && wcscmp(mode, L"name")) {
         return ERROR_INVALID_PARAMETER;
-    } else if (!by_ext && !by_path) {
+    } else if (!by_ext && !by_path && !by_exact) {
         required = name_signature(value, 0);
     }
     path_buffer = malloc(PATH_CHARS * sizeof(*path_buffer));
@@ -432,8 +490,16 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
     workers[0].path = path_buffer;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
-    for (i = 0; i < count; ++i) {
-        const INDEX_ENTRY *entry = &entries[i];
+    if (by_exact) {
+        build_exact_names(index, entries, count);
+        if (index->exact_names) {
+            first = exact_name_bound(index, value, FALSE);
+            count = exact_name_bound(index, value, TRUE);
+            exact_sorted = TRUE;
+        }
+    }
+    for (i = first; i < count; ++i) {
+        const INDEX_ENTRY *entry = exact_sorted ? index->exact_names[i] : &entries[i];
         const wchar_t *path;
         ULONGLONG size;
         if (!entry->name || (entry->attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -441,6 +507,9 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
         if (by_ext) {
             const wchar_t *dot = wcsrchr(entry->name, L'.');
             if (!dot || CompareStringOrdinal(dot + 1, -1, value, -1, TRUE) != CSTR_EQUAL)
+                continue;
+        } else if (by_exact) {
+            if (!exact_sorted && CompareStringOrdinal(entry->name, -1, value, -1, TRUE) != CSTR_EQUAL)
                 continue;
         } else if (!by_path && !by_size && ((entry->name_signature & required) != required ||
                                           !contains(entry->name, value))) {
@@ -600,7 +669,8 @@ static DWORD commands(INDEX *index, const wchar_t *storage_path)
     if (!error) {
         wprintf(L"entries=%zu build_seconds=%.6f\n", index->live + index->file_count,
                 (double)(end.QuadPart - start.QuadPart) / (double)frequency.QuadPart);
-        fwprintf(stderr, L"name TEXT | ext EXT | path TEXT | size MIN:MAX | count MODE VALUE | %lsquit\n",
+        fwprintf(stderr, L"name TEXT | name-exact NAME | ext EXT | path TEXT | size MIN:MAX | "
+                 L"count MODE VALUE | %lsquit\n",
                  index->directory ? L"folder-size | " : L"");
         fflush(stdout);
     }
