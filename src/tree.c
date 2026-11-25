@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "native_stat.h"
+#include "io_budget.h"
 #include <winternl.h>
 #include <winioctl.h>
 #include <stddef.h>
@@ -39,6 +40,7 @@ typedef struct {
 
 typedef struct {
     TREE_RESULT *result;
+    IO_DEVICE device;
     BOOL remove;
     BOOL shallow;
     PTP_POOL pool;
@@ -164,14 +166,19 @@ static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCES
     return error;
 }
 
-static void delete_job(DELETE_JOB *job)
+static void delete_job(DELETE_JOB *job, IO_DEVICE device)
 {
     HANDLE file;
+    IO_PERMIT permit;
+    job->error = io_budget_acquire(&permit, device, device, NULL);
+    if (job->error)
+        return;
     job->error = open_entry(job->parent, job->entry, DELETE, SHARE_READ_ONLY, TRUE, &file, NULL);
     if (!job->error) {
         job->error = remove_open(file);
         CloseHandle(file);
     }
+    io_budget_release(&permit);
 }
 
 static VOID CALLBACK delete_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WORK work)
@@ -184,7 +191,7 @@ static VOID CALLBACK delete_worker(PTP_CALLBACK_INSTANCE instance, PVOID context
         LONG end = min(start + DELETE_WORK_CHUNK, (LONG)walk->count);
         LONG index;
         for (index = start; index < end; ++index)
-            delete_job(&walk->jobs[index]);
+            delete_job(&walk->jobs[index], walk->device);
     }
 }
 
@@ -210,7 +217,7 @@ static void flush_jobs(WALK *walk)
         WaitForThreadpoolWorkCallbacks(walk->work, FALSE);
     } else {
         for (i = 0; i < walk->count; ++i)
-            delete_job(&walk->jobs[i]);
+            delete_job(&walk->jobs[i], walk->device);
     }
     for (i = 0; i < walk->count; ++i) {
         DWORD error = walk->jobs[i].error;
@@ -435,7 +442,11 @@ static DWORD walk_path(const wchar_t *path, BOOL remove, BOOL shallow, DWORD wor
     walk.needle = needle;
     walk.visitor = visitor;
     walk.context = context;
-    result->workers = remove ? (workers ? workers : storage_workers(path)) : 1;
+    result->workers = 1;
+    if (remove) {
+        walk.device = io_device_for_path(path, storage_workers(path));
+        result->workers = workers ? min(workers, walk.device.limit) : walk.device.limit;
+    }
     if (result->workers > MAX_WORKERS)
         result->workers = MAX_WORKERS;
     if (result->workers > 1) {
@@ -637,6 +648,7 @@ DWORD plain_copy(const wchar_t *source, const wchar_t *destination)
 
 typedef struct {
     const TREE_COPY_OPTIONS *options;
+    IO_DEVICE source_device, target_device;
     SRWLOCK report_lock;
     SRWLOCK totals_lock;
     volatile LONG stop_error;
@@ -874,8 +886,23 @@ static VOID CALLBACK copy_worker(PTP_CALLBACK_INSTANCE instance, PVOID context, 
             source[batch->source_length + length] = 0;
             memcpy(target + batch->target_length, entry->FileName, entry->FileNameLength);
             target[batch->target_length + length] = 0;
-            if (!outcome.error)
-                outcome = copy_regular_file(batch, entry, source, target);
+            if (!outcome.error) {
+                IO_PERMIT permit;
+                COPY_OPERATION *operation = batch->operation;
+                HANDLE cancel = operation->options ? operation->options->cancel_event : NULL;
+                outcome.error = io_budget_acquire(&permit, operation->source_device,
+                                                  operation->target_device, cancel);
+                if (!outcome.error) {
+                    outcome.error = copy_stopped(operation);
+                    if (!outcome.error)
+                        outcome = copy_regular_file(batch, entry, source, target);
+                    else
+                        outcome.state = copy_skipped_state(outcome.error);
+                    io_budget_release(&permit);
+                } else if (outcome.error == ERROR_CANCELLED) {
+                    outcome.state = TREE_COPY_CANCELLED;
+                }
+            }
         } else if (!outcome.error) {
             outcome.error = ERROR_FILENAME_EXCED_RANGE;
         }
@@ -1249,7 +1276,7 @@ DWORD copy_new_tree_report(const wchar_t *input, const wchar_t *output, DWORD wo
     TP_CALLBACK_ENVIRON environment;
     wchar_t *paths = NULL, *source_path, *target_path, *destination, *name;
     wchar_t source_fs[16], target_fs[16], *split;
-    DWORD error, length;
+    DWORD error, length, source_workers, target_workers;
     size_t source_length = 0, target_length = 0;
     FILE_BASIC_INFO properties;
     FILE_ID_INFO source_id;
@@ -1289,6 +1316,10 @@ DWORD copy_new_tree_report(const wchar_t *input, const wchar_t *output, DWORD wo
         else
             *split = 0;
         error = open_root(destination, FALSE, TRUE, &parent);
+        if (!error) {
+            target_workers = storage_workers(destination);
+            operation.target_device = io_device_for_path(destination, target_workers);
+        }
         *split = saved;
         *name = first;
     }
@@ -1341,7 +1372,11 @@ DWORD copy_new_tree_report(const wchar_t *input, const wchar_t *output, DWORD wo
     error = directory_path(target, target_path, 32768, &target_length);
     if (error)
         goto done;
-    result->workers = workers ? min(workers, MAX_WORKERS) : min(storage_workers(input), storage_workers(output));
+    source_workers = storage_workers(input);
+    operation.source_device = io_device_for_path(input, source_workers);
+    result->workers = min(operation.source_device.limit, operation.target_device.limit);
+    if (workers)
+        result->workers = min(workers, result->workers);
     batch.source_path = source_path;
     batch.target_path = target_path;
     if (result->workers > 1) {
