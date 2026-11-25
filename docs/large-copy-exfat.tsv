@@ -1,0 +1,5 @@
+source_fs	destination_fs	bytes	mode	copy_seconds	copy_and_flush_seconds	sha256
+NTFS	exFAT	10737418240	buffered	51.432631	52.518056	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
+NTFS	exFAT	10737418240	unbuffered	57.798638	57.799231	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
+NTFS	exFAT	10737418240	no-preallocation	50.761226	53.682140	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
+exFAT	NTFS	10737418240	buffered	51.404559	54.538289	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
