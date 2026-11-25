@@ -163,7 +163,8 @@ static DWORD hash_file(HANDLE file, BYTE *buffer, BYTE digest[SHA256_BYTES])
     return error ? error : status < 0 ? RtlNtStatusToDosError(status) : ERROR_SUCCESS;
 }
 
-DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode)
+DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_COPY_MODE mode,
+                     BOOL hash_after_copy)
 {
     HANDLE input, output = INVALID_HANDLE_VALUE;
     FILE_ATTRIBUTE_TAG_INFO attributes;
@@ -193,9 +194,11 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_CO
         error = ERROR_NOT_ENOUGH_MEMORY;
         goto done;
     }
-    error = hash_file(input, buffer, expected);
-    if (error)
-        goto done;
+    if (!hash_after_copy) {
+        error = hash_file(input, buffer, expected);
+        if (error)
+            goto done;
+    }
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
     error = copy_file_mode(source, destination, mode);
@@ -216,6 +219,11 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_CO
     if (length.QuadPart != copied_length.QuadPart) {
         error = ERROR_CRC;
         goto done;
+    }
+    if (hash_after_copy) {
+        error = hash_file(input, buffer, expected);
+        if (error)
+            goto done;
     }
     error = hash_file(output, buffer, actual);
     if (error)

@@ -42,7 +42,7 @@ static int help(void)
            L"  driver-status | driver-load | driver-unload\n"
            L"  prepare PARENT COUNT flat|deep|mixed|fanout\n"
            L"  prepare-large PARENT MIB\n"
-           L"  bench-copy SOURCE NEW_FILE [--unbuffered|--no-preallocation]\n"
+           L"  bench-copy SOURCE NEW_FILE [--unbuffered|--no-preallocation] [--hash-after-copy]\n"
            L"  win32-size PATH | win32-find PATH NAME\n"
            L"  measure LABEL FILES cold|warm|as-created zero|robocopy EXE [ARGS ...]\n",
            stderr);
@@ -100,18 +100,22 @@ int wmain(int argc, wchar_t **argv)
                 result.files, result.directories, result.bytes, result.errors, result.workers);
     } else if (argc >= 4 && !wcscmp(verb, L"shell-delete") && !wcscmp(argv[2], L"--yes")) {
         error = (DWORD)shell_operation(L"delete", argc - 3, argv + 3, NULL, NULL, TRUE);
-    } else if ((argc == 4 || argc == 5) && (!wcscmp(verb, L"copy-file") || !wcscmp(verb, L"bench-copy"))) {
+    } else if (argc >= 4 && argc <= 6 && (!wcscmp(verb, L"copy-file") || !wcscmp(verb, L"bench-copy"))) {
+        BOOL benchmark = !wcscmp(verb, L"bench-copy");
+        BOOL hash_after_copy = FALSE;
         STDIO_COPY_MODE mode = STDIO_COPY_BUFFERED;
-        if (argc == 5) {
-            if (!wcscmp(argv[4], L"--unbuffered"))
+        for (int i = 4; i < argc; ++i) {
+            if (benchmark && !hash_after_copy && !wcscmp(argv[i], L"--hash-after-copy"))
+                hash_after_copy = TRUE;
+            else if (mode == STDIO_COPY_BUFFERED && !wcscmp(argv[i], L"--unbuffered"))
                 mode = STDIO_COPY_UNBUFFERED;
-            else if (!wcscmp(argv[4], L"--no-preallocation"))
+            else if (mode == STDIO_COPY_BUFFERED && !wcscmp(argv[i], L"--no-preallocation"))
                 mode = STDIO_COPY_NO_PREALLOCATION;
             else
                 return help();
         }
-        if (!wcscmp(verb, L"bench-copy"))
-            error = benchmark_copy(argv[2], argv[3], mode);
+        if (benchmark)
+            error = benchmark_copy(argv[2], argv[3], mode, hash_after_copy);
         else
             error = copy_file_mode(argv[2], argv[3], mode);
     } else if (argc == 3 && !wcscmp(verb, L"storage-info")) {

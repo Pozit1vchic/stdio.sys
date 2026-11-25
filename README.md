@@ -125,6 +125,6 @@ pnputil /delete-driver oemNN.inf /uninstall
 
 ## Производительность
 
-`bench-copy` измеряет обычное копирование одного файла до возврата операции и до завершения сброса буферов Windows. Команда сверяет длину и SHA‑256 основного потока данных. Файл назначения должен быть новым. Обе команды `bench-copy` и `copy-file` принимают `--unbuffered` для режима без буферизации или `--no-preallocation` для записи без предварительного выделения места. [Флаги CopyFile2](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-copyfile2_extended_parameters_v2)
+`bench-copy` измеряет обычное копирование одного файла до возврата операции и до завершения сброса буферов Windows. Команда сверяет длину и SHA‑256 основного потока данных. Файл назначения должен быть новым. Обе команды `bench-copy` и `copy-file` принимают `--unbuffered` для режима без буферизации или `--no-preallocation` для записи без предварительного выделения места. Для замера без предварительного чтения исходника у `bench-copy` есть `--hash-after-copy`. Он переносит проверку исходника за пределы замера и не очищает уже заполненный системный кэш. [Флаги CopyFile2](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-copyfile2_extended_parameters_v2)
 
 [Методика и результаты](docs/benchmarks.md)
