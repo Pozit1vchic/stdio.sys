@@ -167,7 +167,7 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_CO
                      BOOL hash_after_copy)
 {
     HANDLE input, output = INVALID_HANDLE_VALUE;
-    FILE_ATTRIBUTE_TAG_INFO attributes;
+    BY_HANDLE_FILE_INFORMATION attributes;
     BYTE *buffer = NULL;
     BYTE expected[SHA256_BYTES], actual[SHA256_BYTES];
     LARGE_INTEGER length, copied_length, frequency, start, copied, flushed;
@@ -179,16 +179,17 @@ DWORD benchmark_copy(const wchar_t *source, const wchar_t *destination, STDIO_CO
                        FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (input == INVALID_HANDLE_VALUE)
         return GetLastError();
-    if (!GetFileInformationByHandleEx(input, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-        !GetFileSizeEx(input, &length)) {
+    if (!GetFileInformationByHandle(input, &attributes)) {
         error = GetLastError();
         goto done;
     }
-    if (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
-                                     FILE_ATTRIBUTE_READONLY)) {
+    if (attributes.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
+                                       FILE_ATTRIBUTE_READONLY)) {
         error = ERROR_NOT_SUPPORTED;
         goto done;
     }
+    length.LowPart = attributes.nFileSizeLow;
+    length.HighPart = (LONG)attributes.nFileSizeHigh;
     buffer = malloc(HASH_BUFFER);
     if (!buffer) {
         error = ERROR_NOT_ENOUGH_MEMORY;
