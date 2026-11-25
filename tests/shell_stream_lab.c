@@ -15,13 +15,25 @@ typedef HRESULT (*SHELL_STREAMS)(PCWSTR, SHELL_STREAM_VISITOR *);
 
 static SHELL_STREAMS original;
 static volatile LONG hits;
+static volatile LONG requests;
+static volatile LONG pause_claimed;
 static BOOL passthrough;
+static HANDLE resume_first;
+static HANDLE size_worker;
 
 static HRESULT read_streams(PCWSTR path, SHELL_STREAM_VISITOR *visitor)
 {
     ULONGLONG bytes;
     DWORD error;
     HANDLE file;
+    if (resume_first && InterlockedExchange(&pause_claimed, 1) == 0) {
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                        &size_worker, SYNCHRONIZE, FALSE, 0);
+        InterlockedIncrement(&requests);
+        WaitForSingleObject(resume_first, 10000);
+    } else {
+        InterlockedIncrement(&requests);
+    }
     if (passthrough)
         return original(path, visitor);
     file = CreateFileW(path, FILE_READ_ATTRIBUTES,
@@ -89,8 +101,33 @@ __declspec(dllexport) LONG WINAPI ShellStreamLabHits(void)
     return InterlockedCompareExchange(&hits, 0, 0);
 }
 
+__declspec(dllexport) LONG WINAPI ShellStreamLabRequests(void)
+{
+    return InterlockedCompareExchange(&requests, 0, 0);
+}
+
+__declspec(dllexport) void WINAPI ShellStreamLabResume(void)
+{
+    if (resume_first)
+        SetEvent(resume_first);
+}
+
+__declspec(dllexport) DWORD WINAPI ShellStreamLabWaitForWorker(void)
+{
+    DWORD result;
+    /* Called after releasing the first request's event. */
+    if (!size_worker)
+        return ERROR_INVALID_HANDLE;
+    result = WaitForSingleObject(size_worker, 5000);
+    if (result == WAIT_OBJECT_0) {
+        CloseHandle(size_worker);
+        size_worker = NULL;
+    }
+    return result;
+}
+
 /* Call before starting any property worker in the disposable test process. */
-__declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only)
+__declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only, BOOL pause_first)
 {
     const BYTE expected[] = {0xE8, 0xD0, 0xAF, 0x1A, 0x00};
     const BYTE jump[] = {0xFF, 0x25, 0, 0, 0, 0};
@@ -146,12 +183,24 @@ __declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only)
     stub[fallback_offset] = 0xE9;
     relative = (int32_t)delta;
     memcpy(stub + fallback_offset + 1, &relative, sizeof(relative));
+    if (pause_first) {
+        resume_first = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!resume_first) {
+            DWORD error = GetLastError();
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return error;
+        }
+    }
     if (!VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &old) ||
         !FlushInstructionCache(GetCurrentProcess(), stub, fallback_offset + 5) ||
         !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                            (PCWSTR)read_streams, &pinned) ||
         !VirtualProtect(call, sizeof(expected), PAGE_EXECUTE_READWRITE, &old)) {
         DWORD error = GetLastError();
+        if (resume_first) {
+            CloseHandle(resume_first);
+            resume_first = NULL;
+        }
         VirtualFree(stub, 0, MEM_RELEASE);
         return error;
     }

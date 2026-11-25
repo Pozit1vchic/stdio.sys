@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [string]$Tool,
     [string]$LabDll,
-    [switch]$LabPassThrough
+    [switch]$LabPassThrough,
+    [switch]$CheckCancellation
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop on local NTFS.
@@ -18,10 +19,24 @@ using System.Threading;
 public static class FolderPropertiesProbe
 {
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    public delegate uint InstallLab(bool stockOnly);
+    public delegate uint InstallLab(bool stockOnly, bool pauseFirst);
 
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     public delegate int CountLabHits();
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate void ResumeLab();
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate uint WaitForLabWorker();
+
+    public sealed class Lab
+    {
+        public CountLabHits Hits;
+        public CountLabHits Requests;
+        public ResumeLab Resume;
+        public WaitForLabWorker WaitForWorker;
+    }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr LoadLibrary(string path);
@@ -29,20 +44,29 @@ public static class FolderPropertiesProbe
     [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
     private static extern IntPtr GetProcAddress(IntPtr module, string name);
 
-    public static CountLabHits StartLab(string path, bool stockOnly)
+    public static Lab StartLab(string path, bool stockOnly, bool pauseFirst)
     {
         var module = LoadLibrary(path);
         if (module == IntPtr.Zero)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         var installAddress = GetProcAddress(module, "ShellStreamLabInstall");
         var countAddress = GetProcAddress(module, "ShellStreamLabHits");
-        if (installAddress == IntPtr.Zero || countAddress == IntPtr.Zero)
+        var requestsAddress = GetProcAddress(module, "ShellStreamLabRequests");
+        var resumeAddress = GetProcAddress(module, "ShellStreamLabResume");
+        var waitAddress = GetProcAddress(module, "ShellStreamLabWaitForWorker");
+        if (installAddress == IntPtr.Zero || countAddress == IntPtr.Zero ||
+            requestsAddress == IntPtr.Zero || resumeAddress == IntPtr.Zero || waitAddress == IntPtr.Zero)
             throw new InvalidOperationException("Missing Shell experiment exports.");
         var install = Marshal.GetDelegateForFunctionPointer<InstallLab>(installAddress);
-        var error = install(stockOnly);
+        var error = install(stockOnly, pauseFirst);
         if (error != 0)
             throw new System.ComponentModel.Win32Exception((int)error);
-        return Marshal.GetDelegateForFunctionPointer<CountLabHits>(countAddress);
+        return new Lab {
+            Hits = Marshal.GetDelegateForFunctionPointer<CountLabHits>(countAddress),
+            Requests = Marshal.GetDelegateForFunctionPointer<CountLabHits>(requestsAddress),
+            Resume = Marshal.GetDelegateForFunctionPointer<ResumeLab>(resumeAddress),
+            WaitForWorker = Marshal.GetDelegateForFunctionPointer<WaitForLabWorker>(waitAddress)
+        };
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
@@ -88,7 +112,7 @@ public static class FolderPropertiesProbe
 }
 "@
 
-function Read-Properties([string]$Path) {
+function Read-Properties([string]$Path, [int]$FixtureFiles = 0) {
     $name = Split-Path -Leaf $Path
     $process = New-Object Windows.Automation.PropertyCondition(
         [Windows.Automation.AutomationElement]::ProcessIdProperty, $PID)
@@ -105,6 +129,31 @@ function Read-Properties([string]$Path) {
         } until ($window -or $watch.ElapsedMilliseconds -ge 5000)
         if (!$window) { throw "No native property sheet appeared for $Path" }
         $handle = [IntPtr]$window.Current.NativeWindowHandle
+        if ($CheckCancellation) {
+            while (!$lab.Requests.Invoke() -and $watch.ElapsedMilliseconds -lt 5000) {
+                Start-Sleep -Milliseconds 10
+            }
+            if ($lab.Requests.Invoke() -ne 1) { throw 'The first file request did not pause.' }
+            $closeTime = [Diagnostics.Stopwatch]::StartNew()
+            if (![FolderPropertiesProbe]::PostMessage($handle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
+                throw 'Could not close the property sheet.'
+            }
+            if (!$thread.Join(2000)) { throw 'Closing the window waited for the paused file request.' }
+            $closeMilliseconds = $closeTime.Elapsed.TotalMilliseconds
+            $handle = [IntPtr]::Zero
+            $lab.Resume.Invoke()
+            if ($lab.WaitForWorker.Invoke() -ne 0) { throw 'The size worker did not exit after closing the window.' }
+            $total = $lab.Requests.Invoke()
+            if ($total -lt 1 -or $total -ge $FixtureFiles) {
+                throw "Expected cancellation before the end of the traversal, observed $total of $FixtureFiles requests."
+            }
+            return [pscustomobject]@{
+                FileCount = $FixtureFiles
+                RequestsAfterClose = $total - 1
+                CloseMilliseconds = [Math]::Round($closeMilliseconds, 2)
+                Optimized = !$LabPassThrough
+            }
+        }
         $ids = 13064, 13106, 13087
         $before = $null
         $stable = 0
@@ -118,6 +167,7 @@ function Read-Properties([string]$Path) {
         } while ($watch.ElapsedMilliseconds -lt 5000)
         throw "Native property fields did not settle for $Path"
     } finally {
+        if ($CheckCancellation) { $lab.Resume.Invoke() }
         if ($handle -ne [IntPtr]::Zero) {
             [void][FolderPropertiesProbe]::PostMessage($handle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
         }
@@ -133,8 +183,24 @@ function Read-ByteCount([string]$Text) {
 
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $lab = $null
+if ($CheckCancellation -and !$LabDll) { throw 'Cancellation instrumentation requires -LabDll.' }
 if ($LabDll) {
-    $lab = [FolderPropertiesProbe]::StartLab((Resolve-Path -LiteralPath $LabDll).ProviderPath, $LabPassThrough)
+    $lab = [FolderPropertiesProbe]::StartLab((Resolve-Path -LiteralPath $LabDll).ProviderPath,
+        $LabPassThrough, $CheckCancellation)
+}
+if ($CheckCancellation) {
+    $fixture = Join-Path $parent ('stdio-cancel-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($fixture)
+        $fileCount = 1024
+        for ($i = 0; $i -lt $fileCount; $i++) {
+            [IO.File]::WriteAllBytes((Join-Path $fixture "$i.bin"), [byte[]]::new(8192))
+        }
+        Read-Properties $fixture $fileCount
+    } finally {
+        if ([IO.Directory]::Exists($fixture)) { [IO.Directory]::Delete($fixture, $true) }
+    }
+    return
 }
 $cases = 'plain', 'hardlink', 'sparse', 'junction', 'fileStream', 'directoryStream', 'accessDenied'
 $ordinaryAllocation = $null
@@ -179,9 +245,9 @@ foreach ($case in $cases) {
                 }
             }
         }
-        $hitsBefore = if ($lab) { $lab.Invoke() } else { 0 }
+        $hitsBefore = if ($lab) { $lab.Hits.Invoke() } else { 0 }
         $fields = Read-Properties $path
-        $hits = if ($lab) { $lab.Invoke() - $hitsBefore } else { 0 }
+        $hits = if ($lab) { $lab.Hits.Invoke() - $hitsBefore } else { 0 }
         $logical = Read-ByteCount $fields[13064]
         $allocated = Read-ByteCount $fields[13106]
         $expectedBytes = switch ($case) {
