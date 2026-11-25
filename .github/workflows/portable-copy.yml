@@ -1,0 +1,137 @@
+name: Portable filesystem copy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [src/tree.c, .github/workflows/portable-copy.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  portable-copy:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Build and run smoke tests
+        run: |
+          git init
+          git fetch --depth=1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:GITHUB_SHA
+          git checkout --detach FETCH_HEAD
+          cmake -S . -B build -A x64
+          cmake --build build --config Release
+          ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify exFAT transfers and FAT32 limits on a virtual disk
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cli = (Resolve-Path build/Release/stdioctl.exe).Path
+          $work = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString()))
+          if ($work.PSDrive.Free -lt 22GB) { throw 'The test needs 22 GiB of free space on the VM' }
+          $vhd = Join-Path $work.FullName 'portable.vhdx'
+          $diskpartScript = Join-Path $work.FullName 'create.txt'
+          ('create vdisk file="{0}" maximum=32768 type=expandable' -f $vhd) | Set-Content -LiteralPath $diskpartScript -Encoding ascii
+          try {
+            & diskpart /s $diskpartScript
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $vhd -PathType Leaf)) { throw 'VHDX creation failed' }
+            $image = Mount-DiskImage -ImagePath $vhd -PassThru
+            $disk = @($image | Get-Disk)
+            if ($disk.Count -ne 1 -or $disk[0].BusType -ne 'File Backed Virtual' -or
+                $disk[0].PartitionStyle -ne 'RAW' -or $disk[0].IsBoot -or $disk[0].IsSystem) {
+              throw 'The image did not resolve to one uninitialized virtual disk'
+            }
+            $disk = $disk[0] | Initialize-Disk -PassThru -PartitionStyle GPT
+            $fat = $disk | New-Partition -Size 8GB -AssignDriveLetter |
+              Format-Volume -FileSystem FAT32 -NewFileSystemLabel 'STDIO-FAT' -Confirm:$false
+            $exfat = $disk | New-Partition -UseMaximumSize -AssignDriveLetter |
+              Format-Volume -FileSystem exFAT -NewFileSystemLabel 'STDIOEXFAT' -Confirm:$false
+            $fatRoot = "$($fat.DriveLetter):\"
+            $exfatRoot = "$($exfat.DriveLetter):\"
+            foreach ($volume in @($fat, $exfat)) {
+              & $cli storage-info "$($volume.DriveLetter):\"
+              if ($LASTEXITCODE -ne 0) { throw 'Volume inspection failed' }
+            }
+
+            $small = (New-Item -ItemType Directory -Path (Join-Path $work.FullName 'small')).FullName
+            $smallFile = Join-Path $small 'note.txt'
+            [IO.File]::WriteAllText($smallFile, 'portable copy')
+            $fatTree = Join-Path $fatRoot 'small'
+            & $cli copy-new $fatTree $small
+            if ($LASTEXITCODE -ne 0 -or [IO.File]::ReadAllText((Join-Path $fatTree 'note.txt')) -ne 'portable copy') {
+              throw 'NTFS to FAT32 copy failed'
+            }
+            $fatBack = Join-Path $work.FullName 'fat-back'
+            & $cli copy-new $fatBack $fatTree
+            if ($LASTEXITCODE -ne 0 -or [IO.File]::ReadAllText((Join-Path $fatBack 'note.txt')) -ne 'portable copy') {
+              throw 'FAT32 to NTFS copy failed'
+            }
+            Set-Content -LiteralPath $smallFile -Stream 'stdio-meta' -Value 'metadata' -NoNewline
+            foreach ($root in @($fatRoot, $exfatRoot)) {
+              $destination = Join-Path $root 'named-stream-rejected'
+              & $cli copy-new $destination $small
+              if ($LASTEXITCODE -ne 1 -or (Test-Path -LiteralPath (Join-Path $destination 'note.txt'))) {
+                throw 'Copy did not reject an unrepresentable stream before creating the file'
+              }
+            }
+            Write-Output 'fat32_small_roundtrip=passed portable_named_stream_rejection=passed'
+
+            $prepared = & $cli prepare-large $work.FullName 10240
+            $prepared
+            $fixtureLine = @($prepared | Where-Object { $_.StartsWith('path=') })
+            if ($LASTEXITCODE -ne 0 -or $fixtureLine.Count -ne 1) { throw 'Fixture preparation failed' }
+            $fixture = $fixtureLine[0].Substring(5)
+            $name = 'file-0000000.needle'
+            $source = Join-Path $fixture $name
+            $destination = Join-Path $fatRoot 'oversize-rejected'
+            & $cli copy-new $destination $fixture
+            if ($LASTEXITCODE -ne 1 -or (Test-Path -LiteralPath (Join-Path $destination $name))) {
+              throw 'FAT32 oversized file was not rejected before file creation'
+            }
+            Write-Output 'fat32_10gib_rejection=passed'
+
+            $expectedHash = $null
+            foreach ($mode in @('buffered','unbuffered','no-preallocation')) {
+              $target = Join-Path $exfatRoot ($mode + '.bin')
+              $flags = @()
+              if ($mode -ne 'buffered') { $flags += "--$mode" }
+              $report = & $cli bench-copy $source $target @flags
+              $report
+              if ($LASTEXITCODE -ne 0 -or $report -notmatch 'sha256=([0-9a-f]{64})$') { throw "exFAT benchmark failed in $mode mode" }
+              if ($expectedHash -and $Matches[1] -ne $expectedHash) { throw 'Copy hashes disagree' }
+              $expectedHash = $Matches[1]
+              Remove-Item -LiteralPath $target
+            }
+            $exfatTree = Join-Path $exfatRoot 'large'
+            & $cli copy-new $exfatTree $fixture auto
+            if ($LASTEXITCODE -ne 0) { throw 'NTFS to exFAT tree copy failed' }
+            Remove-Item -LiteralPath $source
+            $returnFile = Join-Path $work.FullName 'returned.bin'
+            $report = & $cli bench-copy (Join-Path $exfatTree $name) $returnFile
+            $report
+            if ($LASTEXITCODE -ne 0 -or $report -notmatch 'sha256=([0-9a-f]{64})$' -or $Matches[1] -ne $expectedHash) {
+              throw 'exFAT to NTFS large-file verification failed'
+            }
+            Remove-Item -LiteralPath $returnFile
+            Write-Output 'exfat_10gib_roundtrip=passed'
+            $exfatBack = Join-Path $work.FullName 'exfat-back'
+            & $cli copy-new $exfatBack $exfatTree auto
+            if ($LASTEXITCODE -ne 0 -or (Get-Item -LiteralPath (Join-Path $exfatBack $name)).Length -ne 10GB) {
+              throw 'exFAT to NTFS tree copy failed'
+            }
+            Write-Output 'exfat_10gib_tree_return=passed'
+          } finally {
+            if (Test-Path -LiteralPath $vhd -PathType Leaf) {
+              if ((Get-DiskImage -ImagePath $vhd).Attached) { Dismount-DiskImage -ImagePath $vhd }
+              Remove-Item -LiteralPath $vhd
+            }
+            # The random directory is created above under the ephemeral runner temp path.
+            $resolved = (Resolve-Path -LiteralPath $work.FullName).Path
+            if ([IO.Path]::GetDirectoryName($resolved) -ne (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path) {
+              throw 'Unexpected test workspace path'
+            }
+            Remove-Item -LiteralPath $resolved -Recurse
+          }
