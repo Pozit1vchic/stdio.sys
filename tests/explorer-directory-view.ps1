@@ -9,11 +9,29 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 public static class ExplorerViewOwner
 {
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IoCounters
+    {
+        public ulong Reads, Writes, Other, ReadBytes, WriteBytes, OtherBytes;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessIoCounters(IntPtr process, out IoCounters counters);
+
+    public static IoCounters ReadIo(IntPtr process)
+    {
+        IoCounters counters;
+        if (!GetProcessIoCounters(process, out counters))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return counters;
+    }
 }
 "@
 
@@ -73,6 +91,7 @@ try {
         })
         $explorer.Refresh()
         $cpuStart = $explorer.TotalProcessorTime.TotalMilliseconds
+        $ioStart = [ExplorerViewOwner]::ReadIo($explorer.Handle)
         $navigationStart = [DateTime]::UtcNow
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $view.Navigate2($target)
@@ -96,6 +115,7 @@ try {
             }
         }
         $explorer.Refresh()
+        $ioEnd = [ExplorerViewOwner]::ReadIo($explorer.Handle)
         [pscustomobject]@{
             Round = $round
             ExplorerPID = $owner
@@ -107,6 +127,10 @@ try {
             ProcessCpuMs = [Math]::Round($explorer.TotalProcessorTime.TotalMilliseconds - $cpuStart, 2)
             PeakWorkingSetBytes = $explorer.PeakWorkingSet64
             PrivateBytes = $explorer.PrivateMemorySize64
+            ProcessReads = $ioEnd.Reads - $ioStart.Reads
+            ProcessWrites = $ioEnd.Writes - $ioStart.Writes
+            ProcessOtherIo = $ioEnd.Other - $ioStart.Other
+            ProcessReadBytes = $ioEnd.ReadBytes - $ioStart.ReadBytes
         }
         $view.Navigate2($control)
     }
