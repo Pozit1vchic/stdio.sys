@@ -1,0 +1,5 @@
+mode	source_fs	destination_fs	bytes	copy_seconds	copy_and_flush_seconds	net_destination_used_bytes	sha256
+stdioctl	ReFS	ReFS	10737418240	0.019100	0.019459	-14614528	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
+robocopy-clone-enabled	ReFS	ReFS	10737418240	0.0728699	0.0754511	135168	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
+robocopy-no-clone	ReFS	ReFS	10737418240	41.8362063	47.2723074	10737500160	532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
+stdioctl	ReFS	NTFS	10737418240	44.459235	49.471544		532b873a21a7e3aabc5c6b172dc147aba2f4b4bb0fa2cc55174c5c1460e4ce15
