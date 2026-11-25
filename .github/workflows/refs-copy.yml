@@ -12,7 +12,7 @@ permissions:
 jobs:
   refs-copy:
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 20
     defaults:
       run:
         shell: pwsh
@@ -92,7 +92,52 @@ jobs:
               } finally {
                 $original.Dispose()
               }
-              Remove-Item -LiteralPath $destination, $source
+              Remove-Item -LiteralPath $destination
+              if ($mib -eq 10240 -and (Get-Item -LiteralPath $work.FullName).PSDrive.Free -gt 11GB) {
+                $comparison = (New-Item -ItemType Directory -Path (Join-Path $lab 'robocopy')).FullName
+                $filename = [IO.Path]::GetFileName($source)
+                $baseline = Join-Path $comparison $filename
+                foreach ($mode in @('clone-enabled','no-clone')) {
+                  $expected = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+                  $freeBefore = (Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
+                  $flags = @('/R:0', '/W:0', '/NP')
+                  if ($mode -eq 'no-clone') { $flags += '/NOCLONE' }
+                  $timer = [Diagnostics.Stopwatch]::StartNew()
+                  $null = & robocopy.exe ([IO.Path]::GetDirectoryName($source)) $comparison $filename @flags
+                  if ($LASTEXITCODE -ne 1) { throw "Robocopy did not copy exactly the requested file (exit $LASTEXITCODE)" }
+                  $roboCopyTime = $timer.Elapsed.TotalSeconds
+                  $stream = [IO.File]::Open($baseline, 'Open', 'Write', 'Read')
+                  try { $stream.Flush($true) } finally { $stream.Dispose() }
+                  $timer.Stop()
+                  $allocated = [long]$freeBefore - [long](Get-Volume -DriveLetter $volume.DriveLetter).SizeRemaining
+                  if ((Get-Item -LiteralPath $baseline).Length -ne ($mib * 1MB) -or
+                      (Get-FileHash -LiteralPath $baseline -Algorithm SHA256).Hash -ne $expected) {
+                    throw 'Robocopy length or SHA-256 mismatch'
+                  }
+                  if (($mode -eq 'clone-enabled' -and $allocated -gt 1GB) -or
+                      ($mode -eq 'no-clone' -and $allocated -lt 9GB)) {
+                    throw "Unexpected ReFS allocation delta in Robocopy mode $mode"
+                  }
+                  Write-Output "robocopy_mode=$mode mib=$mib copy_seconds=$roboCopyTime copy_and_flush_seconds=$($timer.Elapsed.TotalSeconds) net_volume_used_bytes=$allocated sha256=$expected"
+                  Remove-Item -LiteralPath $baseline
+                }
+                [IO.Directory]::Delete($comparison)
+                $hostInfo = & $cli storage-info $work.FullName
+                if ($LASTEXITCODE -ne 0 -or ($hostInfo -join ' ') -notmatch '\bfilesystem=NTFS\s+block_clone=0\b') {
+                  throw 'The temporary host directory is not on NTFS'
+                }
+                $crossVolume = Join-Path $work.FullName 'cross-volume.bin'
+                try {
+                  Write-Output 'cross_volume_source=ReFS cross_volume_destination=NTFS'
+                  & $cli bench-copy $source $crossVolume
+                  if ($LASTEXITCODE -ne 0) { throw 'Cross-volume copy or SHA-256 verification failed' }
+                } finally {
+                  if (Test-Path -LiteralPath $crossVolume -PathType Leaf) { Remove-Item -LiteralPath $crossVolume }
+                }
+              } elseif ($mib -eq 10240) {
+                Write-Output 'Skipping the full-copy controls due to insufficient host storage'
+              }
+              Remove-Item -LiteralPath $source
               [IO.Directory]::Delete($fixture[0].Substring(5))
             }
           } finally {
