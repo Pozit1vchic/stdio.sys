@@ -16,6 +16,7 @@ typedef HRESULT (*SHELL_STREAMS)(PCWSTR, SHELL_STREAM_VISITOR *);
 static SHELL_STREAMS original;
 static HRESULT (*original_walk)(void *, PCWSTR);
 static volatile LONG hits;
+static volatile LONG walk_fallbacks;
 static volatile LONG requests;
 static volatile LONG pause_claimed;
 static volatile LONG passthrough;
@@ -40,8 +41,10 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
     if (error || files > MAXDWORD - *(DWORD *)(state + 0x20) ||
         folders > MAXDWORD - *(DWORD *)(state + 0x24) ||
         bytes > MAXULONGLONG - *(ULONGLONG *)(state + 0x10) ||
-        allocated > MAXULONGLONG - *(ULONGLONG *)(state + 0x18))
+        allocated > MAXULONGLONG - *(ULONGLONG *)(state + 0x18)) {
+        InterlockedIncrement(&walk_fallbacks);
         return original_walk(shell_context, path);
+    }
     *(ULONGLONG *)(state + 0x10) += bytes;
     *(ULONGLONG *)(state + 0x18) += allocated;
     *(DWORD *)(state + 0x20) += (DWORD)files;
@@ -278,6 +281,9 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
             } else if (message->lParam == 4) {
                 InterlockedExchange(&passthrough, TRUE);
                 SetPropW(message->hwnd, L"stdio.lab.disabled", (HANDLE)(UINT_PTR)1);
+            } else if (message->lParam == 7) {
+                SetPropW(message->hwnd, L"stdio.lab.walk-fallbacks",
+                         (HANDLE)((UINT_PTR)ReadAcquire(&walk_fallbacks) + 1));
             }
         }
     }

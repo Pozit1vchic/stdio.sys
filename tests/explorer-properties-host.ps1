@@ -4,11 +4,15 @@ param(
     [string]$LabDll,
     [switch]$LabPassThrough,
     [switch]$LabFullWalk,
+    [switch]$Junction,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop.
 $ErrorActionPreference = 'Stop'
+if ($Junction -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough)) {
+    throw 'The junction test requires the active full-walk experiment.'
+}
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System;
@@ -142,6 +146,9 @@ $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $root = Join-Path $parent ('stdio-host-' + [guid]::NewGuid().ToString('N'))
 $name = 'stdio-properties-' + [guid]::NewGuid().ToString('N')
 $child = Join-Path $root $name
+$outside = Join-Path $root 'junction-target'
+$link = Join-Path $child 'junction'
+$sentinel = Join-Path $outside 'sentinel.bin'
 $expectedBytes = [uint64]16384 * $FileCount
 $before = @(Get-Process explorer | Select-Object -ExpandProperty Id)
 $desktop = [Windows.Automation.AutomationElement]::RootElement
@@ -157,6 +164,11 @@ try {
     $payload = [byte[]]::new(16384)
     for ($i = 0; $i -lt $FileCount; $i++) {
         [IO.File]::WriteAllBytes((Join-Path $child "$i.bin"), $payload)
+    }
+    if ($Junction) {
+        [void][IO.Directory]::CreateDirectory($outside)
+        [IO.File]::WriteAllBytes($sentinel, $payload)
+        New-Item -ItemType Junction -Path $link -Target $outside | Out-Null
     }
     Start-Process (Join-Path $env:windir 'explorer.exe') -ArgumentList "/separate,`"$root`""
     $view = Wait-For {
@@ -261,9 +273,15 @@ try {
 
     $hits = if ($dll) { [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits') } else { 0 }
     $expectedHits = if ($dll -and !$LabPassThrough) {
-        if ($LabFullWalk) { 1 } else { $FileCount }
+        if ($Junction) { 0 } elseif ($LabFullWalk) { 1 } else { $FileCount }
     } else { 0 }
     if ($hits -ne $expectedHits) { throw "Expected $expectedHits optimized requests, found $hits." }
+    $fallbacks = if ($dll -and $LabFullWalk) {
+        [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 7, 'stdio.lab.walk-fallbacks')
+    } else { 0 }
+    if ($fallbacks -ne [int][bool]$Junction) {
+        throw "Unexpected full-walk fallback count: $fallbacks."
+    }
     if ($dll) {
         [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
         if (![ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
@@ -300,6 +318,7 @@ try {
         Contains = $fields['13087']
         ComparedCodeBytes = $(if ($dll) { 32 } else { 44 })
         OptimizedRequests = $hits
+        WalkFallbacks = $fallbacks
         VerifiedDisable = [bool]$dll
         FileCount = $FileCount
         FinalFieldsMilliseconds = [Math]::Round($elapsed, 2)
@@ -316,6 +335,11 @@ try {
         [void][ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     }
     if ($view) { $view.Quit() }
+    if ([IO.Directory]::Exists($link)) { [IO.Directory]::Delete($link) }
+    if ([IO.Directory]::Exists($outside)) {
+        [IO.File]::Delete($sentinel)
+        [IO.Directory]::Delete($outside)
+    }
     for ($i = 0; $i -lt $FileCount; $i++) {
         [IO.File]::Delete((Join-Path $child "$i.bin"))
     }
