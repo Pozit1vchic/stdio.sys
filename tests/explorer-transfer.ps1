@@ -4,6 +4,7 @@ param(
     [ValidateRange(1, 20)][int]$Rounds = 5,
     [switch]$Recycle,
     [switch]$ClipboardVerbs,
+    [switch]$CheckCollision,
     [ValidateSet('Both', 'Copy', 'Move')][string]$Operation = 'Both'
 )
 
@@ -11,7 +12,10 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($Recycle -and $ClipboardVerbs) { throw 'Choose recycle or clipboard transfer.' }
 if ($Recycle -and $Operation -ne 'Both') { throw 'The operation filter applies to transfers only.' }
-if ($ClipboardVerbs) { Add-Type -AssemblyName System.Windows.Forms }
+if ($CheckCollision -and ($Recycle -or $ClipboardVerbs -or $Operation -ne 'Both')) {
+    throw 'The collision control uses clipboard copy and paste.'
+}
+if ($ClipboardVerbs -or $CheckCollision) { Add-Type -AssemblyName System.Windows.Forms }
 Add-Type @"
 using System;
 using System.ComponentModel;
@@ -89,6 +93,20 @@ function Wait-Observed([scriptblock]$Read, [string]$Message) {
     throw $Message
 }
 
+function Set-TransferClipboard($Item, [string]$Path, [string]$Verb) {
+    if (!$Item) { throw 'The source fixture did not resolve in Explorer.' }
+    $priorSequence = [TransferProbe]::GetClipboardSequenceNumber()
+    $Item.InvokeVerb($Verb)
+    Wait-Observed {
+        $sequence = [TransferProbe]::GetClipboardSequenceNumber()
+        if ($sequence -eq $priorSequence) { return }
+        $pathsOnClipboard = [Windows.Forms.Clipboard]::GetFileDropList()
+        if ($pathsOnClipboard.Count -eq 1 -and $pathsOnClipboard[0] -eq $Path) {
+            [TransferProbe]::GetClipboardSequenceNumber()
+        }
+    } "Explorer did not set the clipboard for $Verb."
+}
+
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $root = Join-Path $parent ('stdio-transfer-' + [guid]::NewGuid().ToString('N'))
 $target = Join-Path $root 'destination'
@@ -116,6 +134,83 @@ try {
     $explorer = Get-Process -Id $owner
     $patcher = $explorer.Modules | Where-Object ModuleName -eq ExplorerPatcher.amd64.dll
     $destination = $view.Document.Folder
+    if ($CheckCollision) {
+        $clipboard = [TransferProbe+ClipboardBackup]::new()
+        for ($round = 1; $round -le $Rounds; $round++) {
+            if ($null -ne $clipboardSequence -and
+                [TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
+                throw 'The clipboard changed outside the test.'
+            }
+            $folder = 'stdio-collision-' + [guid]::NewGuid().ToString('N')
+            $source = Join-Path $root $folder
+            $output = Join-Path $target $folder
+            [void][IO.Directory]::CreateDirectory($source)
+            [void][IO.Directory]::CreateDirectory($output)
+            $original = Join-Path $source '5000-collision.bin'
+            $existingFile = Join-Path $output '5000-collision.bin'
+            [IO.File]::WriteAllText($original, 'source bytes')
+            [IO.File]::WriteAllText($existingFile, 'destination bytes')
+            $sourceId = [TransferProbe]::Identity($original)
+            $targetId = [TransferProbe]::Identity($existingFile)
+            $markers = @('0000-before.bin', '9999-after.bin')
+            foreach ($marker in $markers) {
+                [IO.File]::WriteAllText((Join-Path $source $marker), $marker)
+            }
+            $item = $destination.ParentFolder.ParseName($folder)
+            $clipboardSequence = Set-TransferClipboard $item $source 'copy'
+            $explorer.Refresh()
+            $cpu = $explorer.TotalProcessorTime.TotalMilliseconds
+            $started = [DateTime]::UtcNow
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            if ([TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
+                throw 'The clipboard changed before paste.'
+            }
+            $destination.Self.InvokeVerb('paste')
+            $elapsed = Wait-Observed {
+                try {
+                    foreach ($marker in $markers) {
+                        if ([IO.File]::ReadAllText((Join-Path $output $marker)) -cne $marker) { return }
+                    }
+                } catch [IO.IOException] {
+                    # The destination may not exist yet or Explorer may still have it open.
+                    return
+                }
+                $watch.Elapsed.TotalMilliseconds
+            } 'Explorer did not produce both noncolliding files.'
+            $explorer.Refresh()
+            $cpuMs = $explorer.TotalProcessorTime.TotalMilliseconds - $cpu
+            foreach ($marker in $markers) {
+                if ([IO.File]::ReadAllText((Join-Path $source $marker)) -cne $marker) {
+                    throw "Unexpected content for $marker."
+                }
+            }
+            if ([IO.File]::ReadAllText($original) -cne 'source bytes' -or
+                [IO.File]::ReadAllText($existingFile) -cne 'destination bytes' -or
+                [TransferProbe]::Identity($original) -ne $sourceId -or
+                [TransferProbe]::Identity($existingFile) -ne $targetId -or
+                [IO.Directory]::GetFiles($output).Count -ne 3) {
+                throw 'The sampled paste outcome differed from the skip-collision control.'
+            }
+            [pscustomobject]@{
+                Operation = 'CopyCollision'
+                EntryPoint = 'ClipboardVerbs'
+                Round = $round
+                ExplorerPID = $owner
+                ExplorerPatcher = $(if ($patcher) { $patcher.FileVersionInfo.FileVersion })
+                StartedUtc = $started.ToString('o')
+                ObservedUtc = $started.AddMilliseconds($elapsed).ToString('o')
+                SourcePath = $source
+                DestinationPath = $output
+                ObservedMs = [Math]::Round($elapsed, 2)
+                ExplorerCpuMs = [Math]::Round($cpuMs, 2)
+                PeakWorkingSetBytes = $explorer.PeakWorkingSet64
+                PrivateBytes = $explorer.PrivateMemorySize64
+                NoncollidingFilesCopied = $markers.Count
+                CollidingFilesPreserved = $true
+            }
+        }
+        return
+    }
     if ($Recycle) {
         $bin = $shell.NameSpace(10)
         [void][IO.Directory]::CreateDirectory($recyclePath)
@@ -181,18 +276,8 @@ try {
                 }
                 $sourceFolder = $view.Document.Folder.ParentFolder
                 $item = $sourceFolder.ParseName([IO.Path]::GetFileName($source))
-                if (!$item) { throw 'The source fixture did not resolve in Explorer.' }
                 $verb = if ($transfer -eq 'Copy') { 'copy' } else { 'cut' }
-                $priorSequence = [TransferProbe]::GetClipboardSequenceNumber()
-                $item.InvokeVerb($verb)
-                $clipboardSequence = Wait-Observed {
-                    $sequence = [TransferProbe]::GetClipboardSequenceNumber()
-                    if ($sequence -eq $priorSequence) { return }
-                    $pathsOnClipboard = [Windows.Forms.Clipboard]::GetFileDropList()
-                    if ($pathsOnClipboard.Count -eq 1 -and $pathsOnClipboard[0] -eq $source) {
-                        [TransferProbe]::GetClipboardSequenceNumber()
-                    }
-                } "Explorer did not set the clipboard for $verb."
+                $clipboardSequence = Set-TransferClipboard $item $source $verb
             }
             $explorer.Refresh()
             $cpu = $explorer.TotalProcessorTime.TotalMilliseconds
