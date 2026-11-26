@@ -5,6 +5,7 @@ param(
     [switch]$Recycle,
     [switch]$ClipboardVerbs,
     [switch]$CheckCollision,
+    [switch]$FlatSelection,
     [string]$LabCopyDll,
     [ValidateSet('Both', 'Copy', 'Move')][string]$Operation = 'Both'
 )
@@ -14,6 +15,9 @@ $ErrorActionPreference = 'Stop'
 if ($Recycle -and $ClipboardVerbs) { throw 'Choose recycle or clipboard transfer.' }
 if ($Recycle -and $Operation -ne 'Both') { throw 'The operation filter applies to transfers only.' }
 if ($Recycle -and !$PSBoundParameters.ContainsKey('FileCount')) { $FileCount = 1 }
+if ($FlatSelection -and (!$ClipboardVerbs -or $Operation -ne 'Copy')) {
+    throw 'Flat selection requires clipboard copy.'
+}
 if ($CheckCollision -and ($Recycle -or $ClipboardVerbs -or $Operation -ne 'Both')) {
     throw 'The collision control uses clipboard copy and paste.'
 }
@@ -120,15 +124,16 @@ function Wait-Observed([scriptblock]$Read, [string]$Message) {
     throw $Message
 }
 
-function Set-TransferClipboard($Item, [string]$Path, [string]$Verb) {
+function Set-TransferClipboard($Item, [string[]]$Paths, [string]$Verb, [switch]$Collection) {
     if (!$Item) { throw 'The source fixture did not resolve in Explorer.' }
     $priorSequence = [TransferProbe]::GetClipboardSequenceNumber()
-    $Item.InvokeVerb($Verb)
+    $expected = [Collections.Generic.HashSet[string]]::new($Paths, [StringComparer]::OrdinalIgnoreCase)
+    if ($Collection) { $Item.InvokeVerbEx($Verb) } else { $Item.InvokeVerb($Verb) }
     Wait-Observed {
         $sequence = [TransferProbe]::GetClipboardSequenceNumber()
         if ($sequence -eq $priorSequence) { return }
         $pathsOnClipboard = [Windows.Forms.Clipboard]::GetFileDropList()
-        if ($pathsOnClipboard.Count -eq 1 -and $pathsOnClipboard[0] -eq $Path) {
+        if ($pathsOnClipboard.Count -eq $expected.Count -and $expected.SetEquals([string[]]@($pathsOnClipboard))) {
             [TransferProbe]::GetClipboardSequenceNumber()
         }
     } "Explorer did not set the clipboard for $Verb."
@@ -339,6 +344,12 @@ try {
             $source = Join-Path $root "$transfer-$round"
             $output = Join-Path $target "$transfer-$round"
             [void][IO.Directory]::CreateDirectory($source)
+            $pasteFolder = $destination
+            if ($FlatSelection) {
+                [void][IO.Directory]::CreateDirectory($output)
+                $pasteFolder = $destination.ParseName([IO.Path]::GetFileName($output)).GetFolder
+                if (!$pasteFolder) { throw 'The flat destination did not resolve in Explorer.' }
+            }
             $paths = for ($i = 0; $i -lt $FileCount; $i++) {
                 $name = '{0:d4}.bin' -f $i
                 [IO.File]::WriteAllBytes((Join-Path $source $name), $bytes)
@@ -356,7 +367,11 @@ try {
                 $sourceFolder = $view.Document.Folder.ParentFolder
                 $item = $sourceFolder.ParseName([IO.Path]::GetFileName($source))
                 $verb = if ($transfer -eq 'Copy') { 'copy' } else { 'cut' }
-                $clipboardSequence = Set-TransferClipboard $item $source $verb
+                if ($FlatSelection) {
+                    $clipboardSequence = Set-TransferClipboard ($item.GetFolder.Items()) ([IO.Directory]::GetFiles($source)) $verb -Collection
+                } else {
+                    $clipboardSequence = Set-TransferClipboard $item $source $verb
+                }
             }
             $explorer.Refresh()
             $cpu = $explorer.TotalProcessorTime.TotalMilliseconds
@@ -366,7 +381,7 @@ try {
                 if ([TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
                     throw 'The clipboard changed before paste.'
                 }
-                $destination.Self.InvokeVerb('paste')
+                $pasteFolder.Self.InvokeVerb('paste')
             }
             elseif ($transfer -eq 'Copy') { $destination.CopyHere($source) }
             else { $destination.MoveHere($source) }
@@ -411,6 +426,7 @@ try {
             [pscustomobject]@{
                 Operation = $transfer
                 EntryPoint = $(if ($clipboard) { 'ClipboardVerbs' } else { 'FolderAutomation' })
+                FlatSelection = [bool]$FlatSelection
                 Round = $round
                 ExplorerPID = $owner
                 StartedUtc = $started.ToString('o')
