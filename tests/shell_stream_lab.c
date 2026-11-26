@@ -197,6 +197,152 @@ static BOOL expected_image(HMODULE shell)
     return valid;
 }
 
+typedef HRESULT (*SEARCH_NOTIFY)(void *, PCWSTR, PCWSTR, DWORD);
+typedef UINT_PTR (WINAPI *SEARCH_TIMER)(HWND, UINT_PTR, UINT, TIMERPROC);
+enum { SEARCH_NOTIFY_CALL = 0x2ABA7C, SEARCH_NOTIFY_TARGET = 0x502C10,
+       SEARCH_TIMER_CALL = 0x180EB4, SEARCH_TIMER_SLOT = 0x600A78,
+       SEARCH_TIMER_POINTER = 32, SEARCH_STOCK_NOTIFY = 64 };
+static const BYTE search_notify_code[] = {0xE8, 0x8F, 0x71, 0x25, 0x00};
+static const BYTE search_timer_code[] = {0x48, 0xFF, 0x15, 0xBD, 0xFB, 0x47, 0x00};
+static SEARCH_NOTIFY stock_search_notify;
+static SEARCH_TIMER stock_search_timer;
+static HWND search_window;
+static BYTE *search_shell;
+static int32_t search_notify_operand, search_timer_operand;
+static DWORD search_thread;
+static volatile LONG search_timer_enabled, search_timer_hits;
+static _Thread_local BOOL fixture_search;
+
+static HRESULT search_notify(void *view, PCWSTR text, PCWSTR stripped, DWORD flags)
+{
+    static const wchar_t query[] = L"System.FileName:=\"fixture-00000.bin\"";
+    BOOL previous = fixture_search;
+    HRESULT result;
+    fixture_search = ReadAcquire(&search_timer_enabled) && GetCurrentThreadId() == search_thread &&
+                     flags == 1 && text && stripped && !wcscmp(text, query) && !wcscmp(stripped, query);
+    result = stock_search_notify(view, text, stripped, flags);
+    fixture_search = previous;
+    return result;
+}
+
+static UINT_PTR WINAPI search_timer(HWND window, UINT_PTR id, UINT delay, TIMERPROC callback)
+{
+    BOOL adjust = fixture_search && id == 5 && delay == 500 && !callback &&
+                  GetAncestor(window, GA_ROOT) == search_window;
+    UINT_PTR timer = stock_search_timer(window, id, adjust ? 100 : delay, callback);
+    if (adjust && timer)
+        InterlockedIncrement(&search_timer_hits);
+    return timer;
+}
+
+static DWORD write_search_operands(BYTE *notify, BYTE *timer, int32_t notify_operand, int32_t timer_operand)
+{
+    DWORD notify_protection, timer_protection, ignore;
+    BOOL notify_flushed, timer_flushed, notify_restored, timer_restored;
+    if (!VirtualProtect(notify, sizeof(search_notify_code), PAGE_EXECUTE_READWRITE, &notify_protection))
+        return GetLastError();
+    if (!VirtualProtect(timer, sizeof(search_timer_code), PAGE_EXECUTE_READWRITE, &timer_protection)) {
+        DWORD error = GetLastError();
+        VirtualProtect(notify, sizeof(search_notify_code), notify_protection, &ignore);
+        return error;
+    }
+    /* Both replaced x64 displacement operands are contained in one cache line. */
+    _InterlockedExchange((volatile LONG *)(notify + 1), notify_operand);
+    _InterlockedExchange((volatile LONG *)(timer + 3), timer_operand);
+    notify_flushed = FlushInstructionCache(GetCurrentProcess(), notify, sizeof(search_notify_code));
+    timer_flushed = FlushInstructionCache(GetCurrentProcess(), timer, sizeof(search_timer_code));
+    notify_restored = VirtualProtect(notify, sizeof(search_notify_code), notify_protection, &ignore);
+    timer_restored = VirtualProtect(timer, sizeof(search_timer_code), timer_protection, &ignore);
+    return notify_flushed && timer_flushed && notify_restored && timer_restored ?
+           ERROR_SUCCESS : ERROR_INVALID_STATE;
+}
+
+static DWORD remove_search_timer(void);
+
+static DWORD install_search_timer(HWND window)
+{
+    static const BYTE indirect_jump[] = {0xFF, 0x25, 0, 0, 0, 0};
+    wchar_t process[MAX_PATH];
+    const wchar_t *name;
+    DWORD length = GetModuleFileNameW(NULL, process, ARRAYSIZE(process));
+    BYTE *shell = (BYTE *)GetModuleHandleW(L"shell32.dll"), *notify, *timer, *stub;
+    DWORD ignore, error;
+    HMODULE pinned;
+    uintptr_t low, high, notify_target = (uintptr_t)search_notify, timer_target = (uintptr_t)search_timer;
+    MEM_ADDRESS_REQUIREMENTS range = {0};
+    MEM_EXTENDED_PARAMETER parameter = {0};
+    int32_t relative;
+    if (search_window)
+        return ERROR_ALREADY_EXISTS;
+    if (!length || length >= ARRAYSIZE(process) ||
+        !(name = wcsrchr(process, L'\\')) || _wcsicmp(name + 1, L"explorer.exe"))
+        return ERROR_NOT_SUPPORTED;
+    if (!shell || !expected_image((HMODULE)shell))
+        return ERROR_REVISION_MISMATCH;
+    notify = shell + SEARCH_NOTIFY_CALL;
+    timer = shell + SEARCH_TIMER_CALL;
+    stock_search_timer = *(SEARCH_TIMER *)(shell + SEARCH_TIMER_SLOT);
+    if (memcmp(notify, search_notify_code, sizeof(search_notify_code)) ||
+        memcmp(timer, search_timer_code, sizeof(search_timer_code)) ||
+        stock_search_timer != (SEARCH_TIMER)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetTimer"))
+        return ERROR_REVISION_MISMATCH;
+
+    low = (uintptr_t)(shell + SEARCH_NOTIFY_TARGET) - INT32_MAX + 0xFFFF;
+    high = (uintptr_t)timer + INT32_MAX;
+    range.LowestStartingAddress = (void *)(low & ~(uintptr_t)0xFFFF);
+    range.HighestEndingAddress = (void *)((high & ~(uintptr_t)0xFFFF) - 1);
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &range;
+    stub = VirtualAlloc2(GetCurrentProcess(), NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                         PAGE_READWRITE, &parameter, 1);
+    if (!stub)
+        return GetLastError();
+    memcpy(stub, indirect_jump, sizeof(indirect_jump));
+    memcpy(stub + sizeof(indirect_jump), &notify_target, sizeof(notify_target));
+    memcpy(stub + SEARCH_TIMER_POINTER, &timer_target, sizeof(timer_target));
+    stub[SEARCH_STOCK_NOTIFY] = 0xE9;
+    relative = (int32_t)((intptr_t)(shell + SEARCH_NOTIFY_TARGET) - (intptr_t)(stub + SEARCH_STOCK_NOTIFY + 5));
+    memcpy(stub + SEARCH_STOCK_NOTIFY + 1, &relative, sizeof(relative));
+    if (!VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &ignore) ||
+        !FlushInstructionCache(GetCurrentProcess(), stub, 4096) ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (PCWSTR)search_notify, &pinned)) {
+        error = GetLastError();
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return error;
+    }
+    stock_search_notify = (SEARCH_NOTIFY)(stub + SEARCH_STOCK_NOTIFY);
+    search_window = window;
+    search_thread = GetCurrentThreadId();
+    search_shell = shell;
+    search_notify_operand = (int32_t)((intptr_t)stub - (intptr_t)(notify + sizeof(search_notify_code)));
+    search_timer_operand = (int32_t)((intptr_t)(stub + SEARCH_TIMER_POINTER) -
+                                     (intptr_t)(timer + sizeof(search_timer_code)));
+    error = write_search_operands(notify, timer, search_notify_operand, search_timer_operand);
+    if (error)
+        remove_search_timer();
+    return error;
+}
+
+static DWORD remove_search_timer(void)
+{
+    BYTE *notify = search_shell + SEARCH_NOTIFY_CALL, *timer = search_shell + SEARCH_TIMER_CALL;
+    int32_t current_notify, current_timer, original_notify, original_timer;
+    InterlockedExchange(&search_timer_enabled, FALSE);
+    if (!memcmp(notify, search_notify_code, sizeof(search_notify_code)) &&
+        !memcmp(timer, search_timer_code, sizeof(search_timer_code)))
+        return ERROR_SUCCESS;
+    memcpy(&current_notify, notify + 1, sizeof(current_notify));
+    memcpy(&current_timer, timer + 3, sizeof(current_timer));
+    if (notify[0] != search_notify_code[0] || memcmp(timer, search_timer_code, 3) ||
+        current_notify != search_notify_operand || current_timer != search_timer_operand)
+        return ERROR_REVISION_MISMATCH;
+    memcpy(&original_notify, search_notify_code + 1, sizeof(original_notify));
+    memcpy(&original_timer, search_timer_code + 3, sizeof(original_timer));
+    /* Keep the pinned stub valid for any call already in progress. */
+    return write_search_operands(notify, timer, original_notify, original_timer);
+}
+
 __declspec(dllexport) LONG WINAPI ShellStreamLabHits(void)
 {
     return InterlockedCompareExchange(&hits, 0, 0);
@@ -366,6 +512,19 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
                 SetPropW(message->hwnd, L"stdio.lab.walk-started", (HANDLE)((UINT_PTR)ReadAcquire64(&walk_started) + 1));
             } else if (message->lParam == 14) {
                 SetPropW(message->hwnd, L"stdio.lab.walk-finished", (HANDLE)((UINT_PTR)ReadAcquire64(&walk_finished) + 1));
+            } else if (message->lParam == 15) {
+                DWORD result = install_search_timer(message->hwnd);
+                SetPropW(message->hwnd, L"stdio.lab.search-install", (HANDLE)((UINT_PTR)result + 1));
+            } else if (message->hwnd == search_window &&
+                       (message->lParam == 16 || message->lParam == 17)) {
+                InterlockedExchange(&search_timer_enabled, message->lParam == 16);
+                SetPropW(message->hwnd, L"stdio.lab.search-mode", (HANDLE)(UINT_PTR)1);
+            } else if (message->hwnd == search_window && message->lParam == 18) {
+                SetPropW(message->hwnd, L"stdio.lab.search-hits",
+                         (HANDLE)((UINT_PTR)ReadAcquire(&search_timer_hits) + 1));
+            } else if (message->hwnd == search_window && message->lParam == 19) {
+                DWORD result = remove_search_timer();
+                SetPropW(message->hwnd, L"stdio.lab.search-remove", (HANDLE)((UINT_PTR)result + 1));
             }
         }
     }

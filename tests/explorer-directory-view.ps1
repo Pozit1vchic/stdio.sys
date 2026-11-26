@@ -4,12 +4,21 @@ param(
     [ValidateRange(1, 30)][int]$Rounds = 5,
     [switch]$Search,
     [switch]$SearchRename,
-    [ValidateSet('FileSystem', 'Shell')][string]$RenameMethod = 'FileSystem'
+    [ValidateSet('FileSystem', 'Shell')][string]$RenameMethod = 'FileSystem',
+    [string]$LabSearchDll,
+    [switch]$CheckSearchFallback
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop.
 $ErrorActionPreference = 'Stop'
 if ($SearchRename) { $Search = $true }
+if ($CheckSearchFallback -and !$LabSearchDll) { throw 'Fallback requires the search lab.' }
+if ($LabSearchDll) {
+    if ($SearchRename) { throw 'Use a separate run for rename and the search timer.' }
+    if (!$CheckSearchFallback -and $Rounds % 2) { throw 'Use an even number of paired search rounds.' }
+    $Search = $true
+    Add-Type -Path (Join-Path $PSScriptRoot 'explorer-process-probe.cs')
+}
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System;
@@ -79,6 +88,12 @@ $searchEdit = New-Condition ([Windows.Automation.AutomationElement]::AutomationI
 $listPane = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'listview'
 $expectedCount = if ($Search) { 1 } else { $FileCount }
 $view = $null
+$labReady = $false
+$searchText = if ($LabSearchDll -and !$CheckSearchFallback) {
+    'System.FileName:="fixture-00000.bin"'
+} else {
+    'fixture-00000'
+}
 
 function Open-SearchBox {
     $view.Navigate2($target)
@@ -88,7 +103,7 @@ function Open-SearchBox {
         $group = $ui.FindFirst($scope, $statusGroup)
         if (!$group) { return }
         $value = $group.FindFirst($scope, $statusValue)
-        if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$FileCount) {
+        if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$directoryCount) {
             $ui.FindFirst($scope, $searchEdit)
         }
     }
@@ -121,22 +136,51 @@ try {
     [void][ExplorerViewOwner]::GetWindowThreadProcessId($window, [ref]$owner)
     if (!$owner -or $owner -in $openProcesses) { throw 'The test view was not isolated.' }
     $explorer = Get-Process -Id $owner
+    if ($LabSearchDll) {
+        if ($explorer.Path -ne (Join-Path $env:windir 'explorer.exe')) {
+            throw 'The test view does not belong to Windows Explorer.'
+        }
+        $labDirectory = Join-Path $root 'lab'
+        [void][IO.Directory]::CreateDirectory($labDirectory)
+        $labPath = Join-Path $labDirectory 'stdio_shell_lab.dll'
+        [IO.File]::Copy((Resolve-Path -LiteralPath $LabSearchDll).ProviderPath, $labPath)
+        $shellImage = $explorer.Modules | Where-Object ModuleName -eq shell32.dll
+        $notifyCall = [IntPtr]::Add($shellImage.BaseAddress, 0x2ABA7C)
+        $timerCall = [IntPtr]::Add($shellImage.BaseAddress, 0x180EB4)
+        $originalNotify = [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $notifyCall, 5))
+        $originalTimer = [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $timerCall, 7))
+        $install = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 15, 'stdio.lab.search-install')
+        if ($install) { throw "The search timer experiment refused to install, Win32 error $install." }
+        $labReady = $true
+    }
     $patcher = $explorer.Modules | Where-Object ModuleName -eq ExplorerPatcher.amd64.dll
+    $directoryCount = $FileCount
     $data = [byte[]]@()
     for ($i = 0; $i -lt $FileCount; $i++) {
         [IO.File]::WriteAllBytes((Join-Path $target ('fixture-{0:d5}.bin' -f $i)), $data)
+    }
+    if ($labReady -and !$CheckSearchFallback) {
+        $nearPath = Join-Path $target ($originalName + '.bak')
+        [IO.File]::WriteAllBytes($nearPath, $data)
+        ++$directoryCount
     }
     for ($round = 1; $round -le $Rounds; $round++) {
         [void](Wait-TestValue {
             !$view.Busy -and $view.Document.Folder.Self.Path -eq $control
         })
         if ($Search) { $searchValue = Open-SearchBox }
+        if ($labReady) {
+            $active = $CheckSearchFallback -or ($round % 4 -in 2,3)
+            $command = if ($active) { 16 } else { 17 }
+            [void][ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, $command, 'stdio.lab.search-mode')
+            $hitsBefore = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits')
+        }
         $explorer.Refresh()
         $cpuStart = $explorer.TotalProcessorTime.TotalMilliseconds
         $ioStart = [ExplorerViewOwner]::ReadIo($explorer.Handle)
         $navigationStart = [DateTime]::UtcNow
         $clock = [Diagnostics.Stopwatch]::StartNew()
-        if ($Search) { $searchValue.SetValue('fixture-00000') } else { $view.Navigate2($target) }
+        if ($Search) { $searchValue.SetValue($searchText) } else { $view.Navigate2($target) }
         $sample = @{ First = $null }
         $total = Wait-TestValue {
             if (!$Search -and $view.Document.Folder.Self.Path -ne $target) { return }
@@ -176,6 +220,19 @@ try {
             ProcessWrites = $ioEnd.Writes - $ioStart.Writes
             ProcessOtherIo = $ioEnd.Other - $ioStart.Other
             ProcessReadBytes = $ioEnd.ReadBytes - $ioStart.ReadBytes
+        }
+        if ($labReady) {
+            $hits = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits') -
+                    $hitsBefore
+            if ($hits -ne [int]($active -and !$CheckSearchFallback)) {
+                throw "Unexpected number of search timer adjustments: $hits."
+            }
+            $result | Add-Member -NotePropertyMembers @{
+                SearchTimerMode = $(if ($CheckSearchFallback) { 'Fallback' }
+                                    elseif ($active) { 'Adjusted' } else { 'PassThrough' })
+                SearchTimerAdjustments = $hits
+                SearchQuery = $searchText
+            }
         }
         if ($SearchRename) {
             $originalPath = Join-Path $target $originalName
@@ -233,8 +290,22 @@ try {
         $result
     }
 } finally {
+    $labCleanupError = $null
+    if ($labReady) {
+        try {
+            $removed = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 19, 'stdio.lab.search-remove')
+            if ($removed) { throw "Could not restore the native search calls, Win32 error $removed." }
+            if ([BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $notifyCall, 5)) -ne $originalNotify -or
+                [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $timerCall, 7)) -ne $originalTimer) {
+                throw 'The native search calls were not restored.'
+            }
+        } catch {
+            $labCleanupError = $_
+        }
+    }
     if ($view) { $view.Quit() }
     if ([IO.Directory]::Exists($target)) {
+        if ($nearPath) { [IO.File]::Delete($nearPath) }
         if ($SearchRename) { [IO.File]::Delete((Join-Path $target $renamedName)) }
         for ($i = 0; $i -lt $FileCount; $i++) {
             [IO.File]::Delete((Join-Path $target ('fixture-{0:d5}.bin' -f $i)))
@@ -242,5 +313,17 @@ try {
         [IO.Directory]::Delete($target)
     }
     if ([IO.Directory]::Exists($control)) { [IO.Directory]::Delete($control) }
-    if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
+    $labMapped = $false
+    if ($labDirectory -and [IO.Directory]::Exists($labDirectory)) {
+        try {
+            [IO.File]::Delete($labPath)
+            [IO.Directory]::Delete($labDirectory)
+        } catch [IO.IOException] {
+            $labMapped = $true
+        } catch [UnauthorizedAccessException] {
+            $labMapped = $true
+        }
+    }
+    if (!$labMapped -and [IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
+    if ($labCleanupError) { throw $labCleanupError }
 }
