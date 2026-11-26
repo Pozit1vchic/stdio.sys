@@ -5,13 +5,16 @@ param(
     [switch]$LabPassThrough,
     [switch]$LabFullWalk,
     [switch]$Junction,
+    [switch]$DeniedDirectory,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop.
 $ErrorActionPreference = 'Stop'
-if ($Junction -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough)) {
-    throw 'The junction test requires the active full-walk experiment.'
+$expectFallback = $Junction -or $DeniedDirectory
+if (($Junction -and $DeniedDirectory) -or
+    ($expectFallback -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough))) {
+    throw 'Select at most one fallback fixture, with the active full-walk experiment.'
 }
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
@@ -125,11 +128,11 @@ function Read-ByteCount([string]$Display) {
     return [uint64]($Display -replace '[^0-9]', '')
 }
 
-function Test-ContainsFiles([string]$Display, [int]$Expected) {
+function Test-ContainsFiles([string]$Display, [int]$Expected, [int]$Folders) {
     $numbers = [regex]::Matches($Display, '[0-9]+(?:[ ,\.\u00a0\u202f][0-9]{3})*')
     return $numbers.Count -eq 2 -and
         (Read-ByteCount $numbers[0].Value) -eq $Expected -and
-        (Read-ByteCount $numbers[1].Value) -eq 0
+        (Read-ByteCount $numbers[1].Value) -eq $Folders
 }
 
 function Find-PropertiesWindow {
@@ -149,6 +152,10 @@ $child = Join-Path $root $name
 $outside = Join-Path $root 'junction-target'
 $link = Join-Path $child 'junction'
 $sentinel = Join-Path $outside 'sentinel.bin'
+$denied = Join-Path $child 'denied'
+$deniedFile = Join-Path $denied 'excluded.bin'
+$originalAcl = $null
+$expectedFolders = [int][bool]$DeniedDirectory
 $expectedBytes = [uint64]16384 * $FileCount
 $before = @(Get-Process explorer | Select-Object -ExpandProperty Id)
 $desktop = [Windows.Automation.AutomationElement]::RootElement
@@ -169,6 +176,16 @@ try {
         [void][IO.Directory]::CreateDirectory($outside)
         [IO.File]::WriteAllBytes($sentinel, $payload)
         New-Item -ItemType Junction -Path $link -Target $outside | Out-Null
+    }
+    if ($DeniedDirectory) {
+        [void][IO.Directory]::CreateDirectory($denied)
+        [IO.File]::WriteAllBytes($deniedFile, $payload)
+        $originalAcl = Get-Acl -LiteralPath $denied
+        $acl = Get-Acl -LiteralPath $denied
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $identity, 'ListDirectory', 'Deny'))
+        Set-Acl -LiteralPath $denied -AclObject $acl
     }
     Start-Process (Join-Path $env:windir 'explorer.exe') -ArgumentList "/separate,`"$root`""
     $view = Wait-For {
@@ -223,7 +240,7 @@ try {
         if ($values.Count -eq 3 -and
             (Read-ByteCount $values['13064']) -eq $expectedBytes -and
             (Read-ByteCount $values['13106']) -eq $expectedBytes -and
-            (Test-ContainsFiles $values['13087'] $FileCount)) { $values }
+            (Test-ContainsFiles $values['13087'] $FileCount $expectedFolders)) { $values }
     } "Explorer did not publish the expected totals for $FileCount files." 10
     $elapsed = $watch.Elapsed.TotalMilliseconds
 
@@ -273,13 +290,13 @@ try {
 
     $hits = if ($dll) { [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits') } else { 0 }
     $expectedHits = if ($dll -and !$LabPassThrough) {
-        if ($Junction) { 0 } elseif ($LabFullWalk) { 1 } else { $FileCount }
+        if ($expectFallback) { 0 } elseif ($LabFullWalk) { 1 } else { $FileCount }
     } else { 0 }
     if ($hits -ne $expectedHits) { throw "Expected $expectedHits optimized requests, found $hits." }
     $fallbacks = if ($dll -and $LabFullWalk) {
         [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 7, 'stdio.lab.walk-fallbacks')
     } else { 0 }
-    if ($fallbacks -ne [int][bool]$Junction) {
+    if ($fallbacks -ne [int]$expectFallback) {
         throw "Unexpected full-walk fallback count: $fallbacks."
     }
     if ($dll) {
@@ -335,6 +352,11 @@ try {
         [void][ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     }
     if ($view) { $view.Quit() }
+    if ($originalAcl) { Set-Acl -LiteralPath $denied -AclObject $originalAcl }
+    if ([IO.Directory]::Exists($denied)) {
+        [IO.File]::Delete($deniedFile)
+        [IO.Directory]::Delete($denied)
+    }
     if ([IO.Directory]::Exists($link)) { [IO.Directory]::Delete($link) }
     if ([IO.Directory]::Exists($outside)) {
         [IO.File]::Delete($sentinel)
