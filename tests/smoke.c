@@ -1,5 +1,6 @@
 #define COBJMACROS
 #include <shlobj.h>
+#include <structuredquery.h>
 #include <winioctl.h>
 #include <wchar.h>
 #include "../src/engine.h"
@@ -18,51 +19,98 @@ static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
     return CloseHandle(file) && ok;
 }
 
-static BOOL shell_result_is(IShellItemArray *items, PCWSTR expected)
+static BOOL shell_results_are(IShellItemArray *items, PCWSTR first, PCWSTR second)
 {
-    IShellItem *item = NULL;
-    PWSTR path = NULL;
-    DWORD count;
-    BOOL ok = items && SUCCEEDED(IShellItemArray_GetCount(items, &count)) && count == 1 &&
-              SUCCEEDED(IShellItemArray_GetItemAt(items, 0, &item)) &&
-              SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &path)) &&
-              !wcscmp(path, expected);
-    CoTaskMemFree(path);
-    if (item)
+    DWORD count, i;
+    if (!items || FAILED(IShellItemArray_GetCount(items, &count)) || count != (second ? 2u : 1u))
+        return FALSE;
+    for (i = 0; i < count; ++i) {
+        IShellItem *item;
+        PWSTR path = NULL;
+        if (FAILED(IShellItemArray_GetItemAt(items, i, &item)))
+            return FALSE;
+        if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &path))) {
+            if (first && !wcscmp(path, first))
+                first = NULL;
+            else if (second && !wcscmp(path, second))
+                second = NULL;
+        }
+        CoTaskMemFree(path);
         IShellItem_Release(item);
-    return ok;
+    }
+    return !first && !second;
+}
+
+static HRESULT query_shell_index(IQueryParser *parser, DIRECTORY_SEARCH *search, PCWSTR query,
+                                 IShellItemArray **items)
+{
+    IQuerySolution *solution;
+    ICondition *condition = NULL;
+    HRESULT hr = IQueryParser_Parse(parser, query, NULL, &solution);
+    if (SUCCEEDED(hr)) {
+        hr = IQuerySolution_GetQuery(solution, &condition, NULL);
+        if (SUCCEEDED(hr))
+            hr = directory_search_condition(search, query, condition, items);
+        if (condition)
+            ICondition_Release(condition);
+        IQuerySolution_Release(solution);
+    }
+    return hr;
 }
 
 static BOOL directory_search_test(PCWSTR root, PCWSTR original)
 {
-    wchar_t renamed[MAX_PATH];
+    wchar_t renamed[MAX_PATH], child[MAX_PATH], same_name[MAX_PATH];
     DIRECTORY_SEARCH *search = NULL;
     IShellItemArray *items = NULL;
+    IQueryParserManager *manager = NULL;
+    IQueryParser *parser = NULL;
+    PCWSTR exact = L"System.FileName:=\"ТЕСТ.txt\"";
     BOOL moved = FALSE, ok = FALSE;
     if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)))
         return FALSE;
     swprintf_s(renamed, ARRAYSIZE(renamed), L"%ls\\новое.txt", root);
-    if (FAILED(directory_search_open(root, &search)) ||
-        directory_search_exact(search, L"ТЕСТ.TXT", &items) != S_OK ||
-        !shell_result_is(items, original) ||
-        directory_search_exact(search, L"*.txt", &items) != E_INVALIDARG ||
-        !shell_result_is(items, original))
+    swprintf_s(child, ARRAYSIZE(child), L"%ls\\search-check", root);
+    swprintf_s(same_name, ARRAYSIZE(same_name), L"%ls\\тест.txt", child);
+    if (!CreateDirectoryW(child, NULL) || !CreateDirectoryW(same_name, NULL) ||
+        FAILED(CoCreateInstance(&CLSID_QueryParserManager, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IQueryParserManager, (void **)&manager)) ||
+        FAILED(IQueryParserManager_CreateLoadedParser(manager, L"SystemIndex", GetUserDefaultUILanguage(),
+                                                       &IID_IQueryParser, (void **)&parser)) ||
+        FAILED(directory_search_open(root, &search)) ||
+        query_shell_index(parser, search, exact, &items) != S_OK ||
+        !shell_results_are(items, original, same_name) ||
+        query_shell_index(parser, search, L"System.FileName:~\"тест\"", &items) != E_NOTIMPL ||
+        query_shell_index(parser, search, L"System.FileName:=\"тест.txt\" AND System.Size:>1",
+                          &items) != E_NOTIMPL ||
+        !shell_results_are(items, original, same_name))
         goto done;
     IShellItemArray_Release(items);
     items = NULL;
     moved = MoveFileW(original, renamed);
-    if (!moved || directory_search_exact(search, L"тест.txt", &items) != S_FALSE || items ||
-        directory_search_exact(search, L"НОВОЕ.TXT", &items) != S_OK)
+    if (!moved || query_shell_index(parser, search, exact, &items) != S_OK ||
+        !shell_results_are(items, same_name, NULL))
+        goto done;
+    IShellItemArray_Release(items);
+    items = NULL;
+    if (query_shell_index(parser, search, L"System.FileName:=\"not-present.txt\"", &items) != S_FALSE ||
+        items || query_shell_index(parser, search, L"System.FileName:=\"НОВОЕ.TXT\"", &items) != S_OK)
         goto done;
     directory_search_close(search);
     search = NULL;
-    ok = shell_result_is(items, renamed);
+    ok = shell_results_are(items, renamed, NULL);
 done:
     if (items)
         IShellItemArray_Release(items);
+    if (parser)
+        IQueryParser_Release(parser);
+    if (manager)
+        IQueryParserManager_Release(manager);
     directory_search_close(search);
     if (moved && !MoveFileW(renamed, original))
         ok = FALSE;
+    RemoveDirectoryW(same_name);
+    RemoveDirectoryW(child);
     CoUninitialize();
     return ok;
 }

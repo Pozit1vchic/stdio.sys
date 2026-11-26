@@ -481,7 +481,8 @@ static int compare_exact_names(const void *left, const void *right)
 
 static void build_exact_names(INDEX *index, const INDEX_ENTRY *entries, size_t count)
 {
-    const size_t maximum = index->directory ? index->file_count : index->live;
+    const size_t maximum = index->directory ? index->file_count + (index->shell_scope ? index->live : 0) :
+                                             index->live;
     size_t i;
     if (index->exact_attempted)
         return;
@@ -494,6 +495,12 @@ static void build_exact_names(INDEX *index, const INDEX_ENTRY *entries, size_t c
     for (i = 0; i < count; ++i) {
         if (entries[i].name && !(entries[i].attributes & FILE_ATTRIBUTE_DIRECTORY))
             index->exact_names[index->exact_count++] = &entries[i];
+    }
+    if (index->shell_scope) {
+        for (i = 0; i < index->capacity; ++i) {
+            if (index->entries[i].name)
+                index->exact_names[index->exact_count++] = &index->entries[i];
+        }
     }
     qsort(index->exact_names, index->exact_count, sizeof(*index->exact_names), compare_exact_names);
 }
@@ -1126,7 +1133,8 @@ static HRESULT verified_item_id(const INDEX *index, const INDEX_ENTRY *entry,
     DWORD attributes;
     HRESULT hr;
     if (!path || !verify_match(entry, path, 0, MAXULONGLONG, &size, &attributes) ||
-        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)))
+        ((attributes ^ entry->attributes) & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)))
         return HRESULT_FROM_WIN32(ERROR_RETRY);
     hr = SHParseDisplayName(path + 4, NULL, id, 0, NULL);
     if (SUCCEEDED(hr))
@@ -1141,7 +1149,7 @@ static HRESULT verified_item_id(const INDEX *index, const INDEX_ENTRY *entry,
     return hr;
 }
 
-HRESULT directory_search_exact(DIRECTORY_SEARCH *search, PCWSTR name, IShellItemArray **items)
+static HRESULT search_exact_name(DIRECTORY_SEARCH *search, PCWSTR name, IShellItemArray **items)
 {
     INDEX *index;
     PIDLIST_ABSOLUTE *ids = NULL;
@@ -1150,7 +1158,7 @@ HRESULT directory_search_exact(DIRECTORY_SEARCH *search, PCWSTR name, IShellItem
     size_t first, count, parsed = 0;
     DWORD error;
     HRESULT hr = S_FALSE;
-    if (!search || !name || !*name || !items || wcspbrk(name, L"\\/:*?\"<>|") ||
+    if (!name || !*name || wcspbrk(name, L"\\/:*?\"<>|") ||
         !wcscmp(name, L".") || !wcscmp(name, L".."))
         return E_INVALIDARG;
     if (!uses_process_token())
@@ -1161,7 +1169,7 @@ HRESULT directory_search_exact(DIRECTORY_SEARCH *search, PCWSTR name, IShellItem
     if (error || !index->watch_pending)
         return HRESULT_FROM_WIN32(error ? error : ERROR_RETRY);
     build_exact_names(index, index->files, index->file_count);
-    if (index->file_count && !index->exact_names)
+    if ((index->file_count || index->live) && !index->exact_names)
         return E_OUTOFMEMORY;
     first = exact_name_bound(index, name, FALSE);
     count = exact_name_bound(index, name, TRUE) - first;
@@ -1199,6 +1207,43 @@ done:
     return hr;
 }
 
+
+HRESULT directory_search_condition(DIRECTORY_SEARCH *search, PCWSTR query, ICondition *condition,
+                                   IShellItemArray **items)
+{
+    static const WCHAR prefix[] = L"System.FileName:=\"";
+    const size_t prefix_length = ARRAYSIZE(prefix) - 1;
+    WCHAR name[256];
+    CONDITION_TYPE type;
+    CONDITION_OPERATION operation;
+    PWSTR property = NULL;
+    size_t length, name_length;
+    HRESULT hr;
+    if (!search || !query || !condition || !items)
+        return E_INVALIDARG;
+    length = wcslen(query);
+    if (length <= prefix_length + 1 || length > prefix_length + ARRAYSIZE(name) ||
+        query[length - 1] != L'"' ||
+        CompareStringOrdinal(query, (int)prefix_length, prefix, (int)prefix_length, TRUE) != CSTR_EQUAL)
+        return E_NOTIMPL;
+    hr = ICondition_GetConditionType(condition, &type);
+    if (FAILED(hr) || type != CT_LEAF_CONDITION)
+        return FAILED(hr) ? hr : E_NOTIMPL;
+    hr = ICondition_GetComparisonInfo(condition, &property, &operation, NULL);
+    if (SUCCEEDED(hr)) {
+        if (operation == COP_EQUAL && property &&
+            CompareStringOrdinal(property, -1, L"System.FileName", -1, TRUE) == CSTR_EQUAL) {
+            name_length = length - prefix_length - 1;
+            wmemcpy(name, query + prefix_length, name_length);
+            name[name_length] = 0;
+            hr = search_exact_name(search, name, items);
+        } else {
+            hr = E_NOTIMPL;
+        }
+    }
+    CoTaskMemFree(property);
+    return hr;
+}
 
 DWORD index_console(const wchar_t *drive)
 {
