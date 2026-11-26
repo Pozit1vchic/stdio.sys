@@ -4,6 +4,7 @@
 typedef struct {
     DWORD cluster;
     ULONGLONG allocated;
+    const volatile LONG *running;
 } WALK_PROPERTIES;
 
 static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
@@ -14,6 +15,8 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     ULONGLONG size, allocation = 0;
     DWORD error;
     UNREFERENCED_PARAMETER(parent);
+    if (properties->running && !ReadAcquire(properties->running))
+        return ERROR_CANCELLED;
     /* The Shell's reparse and provider rules are independent of the engine walk. */
     if (entry->FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE))
         return ERROR_NOT_SUPPORTED;
@@ -35,14 +38,12 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     return ERROR_SUCCESS;
 }
 
-/* Read-only comparison in the host process. The native property worker owns its result. */
-__declspec(dllexport) DWORD WINAPI ShellFolderWalkCompare(PCWSTR path, ULONGLONG *files,
-                                                          ULONGLONG *folders, ULONGLONG *bytes,
-                                                          ULONGLONG *allocated)
+DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, ULONGLONG *files,
+                             ULONGLONG *folders, ULONGLONG *bytes, ULONGLONG *allocated)
 {
     wchar_t volume[MAX_PATH];
     DWORD sectors, sector_bytes, free_clusters, clusters;
-    WALK_PROPERTIES properties = {0};
+    WALK_PROPERTIES properties = { .running = running };
     ULONGLONG id;
     TREE_RESULT totals;
     DWORD error;
@@ -55,9 +56,19 @@ __declspec(dllexport) DWORD WINAPI ShellFolderWalkCompare(PCWSTR path, ULONGLONG
     error = tree_snapshot(path, collect_entry, &properties, &id, &totals);
     if (error)
         return error;
+    if (running && !ReadAcquire(running))
+        return ERROR_CANCELLED;
     *files = totals.files;
     *folders = totals.directories - 1;
     *bytes = totals.bytes;
     *allocated = properties.allocated;
     return ERROR_SUCCESS;
+}
+
+/* Read-only comparison in the host process. The native property worker owns its result. */
+__declspec(dllexport) DWORD WINAPI ShellFolderWalkCompare(PCWSTR path, ULONGLONG *files,
+                                                          ULONGLONG *folders, ULONGLONG *bytes,
+                                                          ULONGLONG *allocated)
+{
+    return folder_walk_properties(path, NULL, files, folders, bytes, allocated);
 }

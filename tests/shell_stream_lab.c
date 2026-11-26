@@ -5,7 +5,7 @@
 #include <wchar.h>
 
 /* shell32.dll 10.0.28000.1643, x64. Private ABI verified for this image only. */
-enum { CALL_RVA = 0x35BF7, STREAM_RVA = 0x1E0BCC };
+enum { CALL_RVA = 0x35BF7, STREAM_RVA = 0x1E0BCC, WALK_CALL_RVA = 0x34D816, WALK_RVA = 0x44AE38 };
 typedef struct {
     ULONGLONG *total;
     DWORD *minimum;
@@ -14,6 +14,7 @@ typedef struct {
 typedef HRESULT (*SHELL_STREAMS)(PCWSTR, SHELL_STREAM_VISITOR *);
 
 static SHELL_STREAMS original;
+static HRESULT (*original_walk)(void *, PCWSTR);
 static volatile LONG hits;
 static volatile LONG requests;
 static volatile LONG pause_claimed;
@@ -21,6 +22,33 @@ static volatile LONG passthrough;
 static HANDLE resume_first;
 static HANDLE size_worker;
 static BOOL explorer_host;
+
+DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, ULONGLONG *files,
+                             ULONGLONG *folders, ULONGLONG *bytes, ULONGLONG *allocated);
+
+static HRESULT walk_folder(void *shell_context, PCWSTR path)
+{
+    BYTE *state = shell_context;
+    volatile LONG *running = (volatile LONG *)(state + 0x08);
+    ULONGLONG files, folders, bytes, allocated;
+    DWORD error;
+    if (ReadAcquire(&passthrough) || !wcsstr(path, L"\\stdio-properties-"))
+        return original_walk(shell_context, path);
+    error = folder_walk_properties(path, running, &files, &folders, &bytes, &allocated);
+    if (!ReadAcquire(running))
+        return E_ABORT;
+    if (error || files > MAXDWORD - *(DWORD *)(state + 0x20) ||
+        folders > MAXDWORD - *(DWORD *)(state + 0x24) ||
+        bytes > MAXULONGLONG - *(ULONGLONG *)(state + 0x10) ||
+        allocated > MAXULONGLONG - *(ULONGLONG *)(state + 0x18))
+        return original_walk(shell_context, path);
+    *(ULONGLONG *)(state + 0x10) += bytes;
+    *(ULONGLONG *)(state + 0x18) += allocated;
+    *(DWORD *)(state + 0x20) += (DWORD)files;
+    *(DWORD *)(state + 0x24) += (DWORD)folders;
+    InterlockedIncrement(&hits);
+    return S_OK;
+}
 
 static HRESULT read_streams(PCWSTR path, SHELL_STREAM_VISITOR *visitor)
 {
@@ -128,12 +156,16 @@ __declspec(dllexport) DWORD WINAPI ShellStreamLabWaitForWorker(void)
     return result;
 }
 
-static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
+static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer, BOOL full_walk)
 {
-    const BYTE expected[] = {0xE8, 0xD0, 0xAF, 0x1A, 0x00};
+    const BYTE stream_expected[] = {0xE8, 0xD0, 0xAF, 0x1A, 0x00};
+    const BYTE walk_expected[] = {0xE8, 0x1D, 0xD6, 0x0F, 0x00};
+    const BYTE *expected = full_walk ? walk_expected : stream_expected;
+    const SIZE_T call_size = sizeof(stream_expected);
+    const unsigned original_rva = full_walk ? WALK_RVA : STREAM_RVA;
     const BYTE jump[] = {0xFF, 0x25, 0, 0, 0, 0};
     const unsigned fallback_offset = 32;
-    const uintptr_t target = (uintptr_t)read_streams;
+    const uintptr_t target = full_walk ? (uintptr_t)walk_folder : (uintptr_t)read_streams;
     wchar_t process[MAX_PATH];
     HMODULE pinned;
     BYTE *shell, *call, *stub;
@@ -153,11 +185,11 @@ static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
     shell = (BYTE *)GetModuleHandleW(L"shell32.dll");
     if (!shell || !expected_image((HMODULE)shell))
         return ERROR_REVISION_MISMATCH;
-    call = shell + CALL_RVA;
-    if (memcmp(call, expected, sizeof(expected)))
+    call = shell + (full_walk ? WALK_CALL_RVA : CALL_RVA);
+    if (memcmp(call, expected, call_size))
         return ERROR_REVISION_MISMATCH;
-    from = (uintptr_t)(call + sizeof(expected));
-    range.LowestStartingAddress = (void *)(((uintptr_t)(shell + STREAM_RVA) -
+    from = (uintptr_t)(call + call_size);
+    range.LowestStartingAddress = (void *)(((uintptr_t)(shell + original_rva) -
                                              INT32_MAX + 0xFFFF) & ~(uintptr_t)0xFFFF);
     range.HighestEndingAddress = (void *)(((from + INT32_MAX) & ~(uintptr_t)0xFFFF) - 1);
     parameter.Type = MemExtendedParameterAddressRequirements;
@@ -175,7 +207,7 @@ static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
     memcpy(stub + sizeof(jump), &target, sizeof(target));
     /* The original helper is a direct-call target in Shell, so use a direct
        branch to it from the aligned fallback entry. */
-    delta = (intptr_t)((uintptr_t)(shell + STREAM_RVA) -
+    delta = (intptr_t)((uintptr_t)(shell + original_rva) -
                       (uintptr_t)(stub + fallback_offset + 5));
     if (delta < INT32_MIN || delta > INT32_MAX) {
         VirtualFree(stub, 0, MEM_RELEASE);
@@ -196,7 +228,7 @@ static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
         !FlushInstructionCache(GetCurrentProcess(), stub, fallback_offset + 5) ||
         !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                            (PCWSTR)read_streams, &pinned) ||
-        !VirtualProtect(call, sizeof(expected), PAGE_EXECUTE_READWRITE, &old)) {
+        !VirtualProtect(call, call_size, PAGE_EXECUTE_READWRITE, &old)) {
         DWORD error = GetLastError();
         if (resume_first) {
             CloseHandle(resume_first);
@@ -205,15 +237,18 @@ static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
         VirtualFree(stub, 0, MEM_RELEASE);
         return error;
     }
-    original = (SHELL_STREAMS)(stub + fallback_offset);
+    if (full_walk)
+        original_walk = (HRESULT (*)(void *, PCWSTR))(stub + fallback_offset);
+    else
+        original = (SHELL_STREAMS)(stub + fallback_offset);
     passthrough = stock_only;
     explorer_host = for_explorer;
     relative = (int32_t)((uintptr_t)stub - from);
-    /* The operand is naturally aligned on the checked image. */
-    InterlockedExchange((volatile LONG *)(call + 1), relative);
+    /* This x64-only test changes an operand contained in one cache line. */
+    _InterlockedExchange((volatile LONG *)(call + 1), relative);
     {
-        BOOL flushed = FlushInstructionCache(GetCurrentProcess(), call, sizeof(expected));
-        BOOL restored = VirtualProtect(call, sizeof(expected), old, &ignore);
+        BOOL flushed = FlushInstructionCache(GetCurrentProcess(), call, call_size);
+        BOOL restored = VirtualProtect(call, call_size, old, &ignore);
         if (!flushed || !restored)
             return ERROR_INVALID_STATE;
     }
@@ -223,7 +258,7 @@ static DWORD install(BOOL stock_only, BOOL pause_first, BOOL for_explorer)
 /* Call before starting any property worker in the disposable test process. */
 __declspec(dllexport) DWORD WINAPI ShellStreamLabInstall(BOOL stock_only, BOOL pause_first)
 {
-    return install(stock_only, pause_first, FALSE);
+    return install(stock_only, pause_first, FALSE, FALSE);
 }
 
 __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM wparam, LPARAM lparam)
@@ -232,8 +267,10 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
         const CWPSTRUCT *message = (const CWPSTRUCT *)lparam;
         if (message->message == RegisterWindowMessageW(L"stdio.shell.stream.lab.2026") &&
             message->wParam == GetCurrentProcessId() && message->hwnd != GetShellWindow()) {
-            if (message->lParam == 1 || message->lParam == 2) {
-                DWORD result = install(message->lParam == 2, FALSE, TRUE);
+            if (message->lParam == 1 || message->lParam == 2 ||
+                message->lParam == 5 || message->lParam == 6) {
+                DWORD result = install(message->lParam == 2 || message->lParam == 6, FALSE, TRUE,
+                                       message->lParam >= 5);
                 SetPropW(message->hwnd, L"stdio.lab.install", (HANDLE)((UINT_PTR)result + 1));
             } else if (message->lParam == 3) {
                 SetPropW(message->hwnd, L"stdio.lab.hits",

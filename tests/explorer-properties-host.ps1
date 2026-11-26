@@ -3,6 +3,7 @@ param(
     [switch]$RequireExplorerPatcher,
     [string]$LabDll,
     [switch]$LabPassThrough,
+    [switch]$LabFullWalk,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
@@ -182,7 +183,8 @@ try {
         [void][IO.Directory]::CreateDirectory($labDirectory)
         $dll = Join-Path $labDirectory 'stdio_shell_lab.dll'
         [IO.File]::Copy($source, $dll)
-        $command = if ($LabPassThrough) { 2 } else { 1 }
+        $command = if ($LabFullWalk) { 5 } else { 1 }
+        if ($LabPassThrough) { $command++ }
         $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, $command, 'stdio.lab.install')
         if ($result) { throw "The Explorer experiment refused to install, Win32 error $result." }
     }
@@ -234,14 +236,19 @@ try {
     if (!$local -or $local.FileName -ne $image.FileName) {
         throw 'The control and Explorer processes have different Shell images.'
     }
-    $expectedCall = 'E8-D0-AF-1A-00'
+    $expectedCall = if ($LabFullWalk) { 'E8-1D-D6-0F-00' } else { 'E8-D0-AF-1A-00' }
+    $callOffset = if ($LabFullWalk) { 0x34D816 } else { 0x35BF7 }
+    $helperOffset = if ($LabFullWalk) { 0x44AE38 } else { 0x1E0BCC }
     $actualCall = [ExplorerProcessProbe]::ReadCode($owner,
-        [IntPtr]::Add($image.BaseAddress, 0x35BF7), 5)
+        [IntPtr]::Add($image.BaseAddress, $callOffset), 5)
     if (!$dll -and [BitConverter]::ToString($actualCall) -ne $expectedCall) {
         throw 'The Explorer call no longer targets the expected helper.'
     }
-    foreach ($range in @(@{ Name='WalkerCall'; Offset=0x35BF7; Length=12 },
-                         @{ Name='StreamHelperEntry'; Offset=0x1E0BCC; Length=32 })) {
+    if ($dll -and ($actualCall[0] -ne 0xE8 -or [BitConverter]::ToString($actualCall) -eq $expectedCall)) {
+        throw 'The requested Shell call was not redirected.'
+    }
+    foreach ($range in @(@{ Name='WalkerCall'; Offset=$callOffset; Length=12 },
+                         @{ Name='OriginalHelperEntry'; Offset=$helperOffset; Length=32 })) {
         if ($dll -and $range.Name -eq 'WalkerCall') { continue }
         $stock = [ExplorerProcessProbe]::ReadCode($PID,
             [IntPtr]::Add($local.BaseAddress, $range.Offset), $range.Length)
@@ -253,7 +260,9 @@ try {
     }
 
     $hits = if ($dll) { [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits') } else { 0 }
-    $expectedHits = if ($dll -and !$LabPassThrough) { $FileCount } else { 0 }
+    $expectedHits = if ($dll -and !$LabPassThrough) {
+        if ($LabFullWalk) { 1 } else { $FileCount }
+    } else { 0 }
     if ($hits -ne $expectedHits) { throw "Expected $expectedHits optimized requests, found $hits." }
     if ($dll) {
         [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
