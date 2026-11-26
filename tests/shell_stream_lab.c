@@ -22,6 +22,8 @@ static HRESULT (*original_walk)(void *, PCWSTR);
 static volatile LONG hits;
 static volatile LONG walk_fallbacks;
 static volatile LONG walk_cancelled;
+static volatile LONG walk_yields, budgeted_walk;
+static DWORD budget_control_thread;
 static volatile LONG64 walk_started;
 static volatile LONG64 walk_finished;
 static volatile LONG requests;
@@ -91,6 +93,7 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
     BYTE *state = shell_context;
     volatile LONG *running = (volatile LONG *)(state + 0x08);
     FOLDER_WALK_TOTALS totals, zero = {0};
+    FOLDER_WALK_BUDGET budget = {0};
     WALK_PROGRESS progress = {
         .state = state,
         .baseline = { *(DWORD *)(state + 0x20), *(DWORD *)(state + 0x24),
@@ -104,8 +107,11 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
     InterlockedExchange64(&walk_started, now.QuadPart);
     if (ReadAcquire(&passthrough))
         return finish_walk(original_walk(shell_context, path));
+    if (ReadAcquire(&budgeted_walk) && GetCurrentThreadId() != budget_control_thread)
+        budget.device = io_device_for_path(path, storage_workers(path));
     error = folder_walk_properties(path, running, resume_first && !pause_after_progress ? pause_walk_entry : NULL,
-                                   report_walk, &progress, &totals);
+                                   report_walk, &progress, budget.device.known ? &budget : NULL, &totals);
+    InterlockedExchange(&walk_yields, (LONG)budget.yielded);
     if (!error)
         error = publish_walk(&progress, &totals);
     if (error == ERROR_CANCELLED || !ReadAcquire(running)) {
@@ -358,7 +364,8 @@ static BYTE *copy_call;
 static int32_t copy_operand;
 static HWND copy_window;
 static DWORD copy_ui_thread;
-static volatile LONG copy_enabled, copy_accounted;
+static volatile LONG copy_enabled, copy_accounted, copy_active;
+static volatile LONG64 copy_finished;
 static _Thread_local struct {
     wchar_t root[MAX_PATH];
     IO_DEVICE device;
@@ -396,10 +403,15 @@ static HRESULT WINAPI account_copy(PCWSTR source, PCWSTR destination, COPYFILE2_
         return native_copy(source, destination, parameters);
     }
     io_budget_account_native(&permit, device, device);
+    InterlockedIncrement(&copy_active);
     SetLastError(last);
     result = native_copy(source, destination, parameters);
     last = GetLastError();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    InterlockedExchange64(&copy_finished, now.QuadPart);
     io_budget_release(&permit);
+    InterlockedDecrement(&copy_active);
     InterlockedIncrement(&copy_accounted);
     SetLastError(last);
     return result;
@@ -677,6 +689,19 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
             } else if (message->hwnd == copy_window && message->lParam == 22) {
                 DWORD result = remove_copy_accounting();
                 SetPropW(message->hwnd, L"stdio.lab.copy-remove", (HANDLE)((UINT_PTR)result + 1));
+            } else if (message->hwnd == copy_window && message->lParam == 23) {
+                budget_control_thread = GetCurrentThreadId();
+                InterlockedExchange(&budgeted_walk, TRUE);
+                SetPropW(message->hwnd, L"stdio.lab.walk-budget", (HANDLE)(UINT_PTR)1);
+            } else if (message->hwnd == copy_window && message->lParam == 24) {
+                SetPropW(message->hwnd, L"stdio.lab.walk-yields",
+                         (HANDLE)((UINT_PTR)ReadAcquire(&walk_yields) + 1));
+            } else if (message->hwnd == copy_window && message->lParam == 25) {
+                SetPropW(message->hwnd, L"stdio.lab.copy-active",
+                         (HANDLE)((UINT_PTR)ReadAcquire(&copy_active) + 1));
+            } else if (message->hwnd == copy_window && message->lParam == 26) {
+                SetPropW(message->hwnd, L"stdio.lab.copy-finished",
+                         (HANDLE)((UINT_PTR)ReadAcquire64(&copy_finished) + 1));
             }
         }
     }

@@ -8,6 +8,8 @@ param(
     [switch]$DeniedDirectory,
     [switch]$CheckWalkCancellation,
     [switch]$CheckWalkProgress,
+    [switch]$ConcurrentCopy,
+    [switch]$LabWalkBudget,
     [ValidateRange(0, 16)][int]$Depth = 0,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
@@ -15,6 +17,11 @@ param(
 # Run with Windows PowerShell -STA on an interactive desktop.
 $ErrorActionPreference = 'Stop'
 $expectFallback = $Junction -or $DeniedDirectory
+if (($LabWalkBudget -and !$ConcurrentCopy) -or
+    ($ConcurrentCopy -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough -or $expectFallback -or
+                          $CheckWalkProgress -or $CheckWalkCancellation))) {
+    throw 'Concurrent copy requires the active full walk with an ordinary fixture.'
+}
 if ($CheckWalkCancellation -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough -or $expectFallback)) {
     throw 'Cancellation requires the active full walk with a regular directory.'
 }
@@ -62,7 +69,8 @@ function Find-PropertiesWindow {
 }
 
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
-$root = Join-Path $parent ('stdio-host-' + [guid]::NewGuid().ToString('N'))
+$rootPrefix = if ($ConcurrentCopy) { 'stdio-transfer-' } else { 'stdio-host-' }
+$root = Join-Path $parent ($rootPrefix + [guid]::NewGuid().ToString('N'))
 $name = 'stdio-properties-' + [guid]::NewGuid().ToString('N')
 $child = Join-Path $root $name
 $outside = Join-Path $root 'junction-target'
@@ -83,6 +91,7 @@ $view = $null
 $dialogHandle = [IntPtr]::Zero
 $dll = $null
 $labDirectory = $null
+$copyReady = $false
 
 try {
     [void][IO.Directory]::CreateDirectory($child)
@@ -94,6 +103,22 @@ try {
     $payload = [byte[]]::new(16384)
     for ($i = 0; $i -lt $FileCount; $i++) {
         [IO.File]::WriteAllBytes((Join-Path $fileDirectory "$i.bin"), $payload)
+    }
+    if ($ConcurrentCopy) {
+        $copySource = Join-Path $root 'copy-source'
+        $copyTarget = Join-Path $root 'copy-target'
+        $copyOutput = Join-Path $copyTarget 'copy-source'
+        [void][IO.Directory]::CreateDirectory($copySource)
+        [void][IO.Directory]::CreateDirectory($copyTarget)
+        $copyBytes = [byte[]]::new(32MB)
+        [Random]::new(2417).NextBytes($copyBytes)
+        $copyNames = @(1..12 | ForEach-Object { "copy-$_.bin" })
+        foreach ($filename in $copyNames) {
+            [IO.File]::WriteAllBytes((Join-Path $copySource $filename), $copyBytes)
+        }
+        $copyFileBytes = $copyBytes.Length
+        $copyBytes = $null
+        $copyHash = (Get-FileHash -LiteralPath (Join-Path $copySource $copyNames[0])).Hash
     }
     if ($Junction) {
         [void][IO.Directory]::CreateDirectory($outside)
@@ -137,10 +162,21 @@ try {
         [IO.File]::Copy($source, $dll)
         $command = if ($LabFullWalk) { 5 } else { 1 }
         if ($LabPassThrough) { $command++ }
-        if ($CheckWalkCancellation) { $command = 8 }
+        if ($CheckWalkCancellation -or $ConcurrentCopy) { $command = 8 }
         if ($CheckWalkProgress) { $command = 12 }
         $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, $command, 'stdio.lab.install')
         if ($result) { throw "The Explorer experiment refused to install, Win32 error $result." }
+        if ($ConcurrentCopy) {
+            $image = $explorer.Modules | Where-Object ModuleName -eq windows.storage.dll
+            $nativeCopy = [IntPtr]::Add($image.BaseAddress, 0x34AE60)
+            $stockCopy = [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $nativeCopy, 7))
+            $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 20, 'stdio.lab.copy-install')
+            if ($result) { throw "Copy accounting refused to install, Win32 error $result." }
+            $copyReady = $true
+            if ($LabWalkBudget) {
+                [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 23, 'stdio.lab.walk-budget')
+            }
+        }
     }
 
     $item = $view.Document.Folder.ParseName($name)
@@ -153,6 +189,19 @@ try {
     $dialogHandle = [IntPtr]$dialog.Current.NativeWindowHandle
     if ($dialog.Current.ProcessId -ne $owner) {
         throw 'Properties ran in a different process from the isolated Explorer window.'
+    }
+    if ($ConcurrentCopy) {
+        [void](Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 9, 'stdio.lab.paused') -eq 1
+        } 'The full walk did not pause before its first file.')
+        $destination = $view.Document.Folder.ParseName('copy-target').GetFolder
+        if (!$destination) { throw 'The copy destination is missing from Explorer.' }
+        $copyStartTick = [Diagnostics.Stopwatch]::GetTimestamp()
+        $destination.CopyHere($copySource)
+        [void](Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 25, 'stdio.lab.copy-active') -gt 0
+        } 'Explorer did not start a native copy in the properties process.' 1)
+        [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 10, 'stdio.lab.resumed')
     }
 
     if ($CheckWalkCancellation) {
@@ -215,11 +264,31 @@ try {
     } "Explorer did not publish the expected totals for $FileCount files." 10
     $fieldsTick = [Diagnostics.Stopwatch]::GetTimestamp()
     $elapsed = $watch.Elapsed.TotalMilliseconds
+    if ($ConcurrentCopy) {
+        [void](Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 21, 'stdio.lab.copy-accounted') -eq $copyNames.Count
+        } 'Explorer did not account for all copies.' 10)
+        $copyEnd = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 26, 'stdio.lab.copy-finished')
+        $copyElapsed = [Math]::Round(($copyEnd - $copyStartTick) * 1000 / [Diagnostics.Stopwatch]::Frequency, 2)
+        $yields = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 24, 'stdio.lab.walk-yields')
+        if ([bool]$yields -ne [bool]$LabWalkBudget) {
+            throw "Unexpected number of background yields for this mode: $yields."
+        }
+    }
 
     $explorer.Refresh()
     $cpu = $explorer.TotalProcessorTime.TotalMilliseconds - $baselineCpu
     $peakWorkingSet = $explorer.PeakWorkingSet64
     $privateBytes = $explorer.PrivateMemorySize64
+    if ($ConcurrentCopy) {
+        foreach ($filename in $copyNames) {
+            $path = Join-Path $copyOutput $filename
+            if ((Get-Item -LiteralPath $path).Length -ne $copyFileBytes -or
+                (Get-FileHash -LiteralPath $path).Hash -ne $copyHash) {
+                throw "Unexpected copied data in $path"
+            }
+        }
+    }
     $image = $explorer.Modules | Where-Object { $_.ModuleName -eq 'shell32.dll' } | Select-Object -First 1
     $patcher = $explorer.Modules | Where-Object { $_.ModuleName -eq 'ExplorerPatcher.amd64.dll' } |
         Select-Object -First 1
@@ -334,21 +403,38 @@ try {
         ProcessCpuMilliseconds = [Math]::Round($cpu, 2)
         ProcessPeakWorkingSetBytes = $peakWorkingSet
         ProcessPrivateBytes = $privateBytes
+        ConcurrentCopyMilliseconds = $copyElapsed
+        BackgroundWalkBudget = [bool]$LabWalkBudget
+        WalkNativeYields = $yields
     }
 } finally {
+    $copyCleanupError = $null
     if ($dll -and $view) {
         try {
             [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
-            if ($CheckWalkCancellation -or $CheckWalkProgress) {
+            if ($CheckWalkCancellation -or $CheckWalkProgress -or $ConcurrentCopy) {
                 [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 10, 'stdio.lab.resumed')
             }
         }
         catch { Write-Warning "Could not disable the experimental path: $_" }
+        if ($copyReady) {
+            try {
+                $removed = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 22, 'stdio.lab.copy-remove')
+                if ($removed -or [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $nativeCopy, 7)) -ne $stockCopy) {
+                    throw 'Could not restore the native copy call.'
+                }
+            } catch { $copyCleanupError = $_ }
+        }
     }
     if ($dialogHandle -ne [IntPtr]::Zero) {
         [void][ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
     }
     if ($view) { $view.Quit() }
+    foreach ($path in $copyOutput, $copyTarget, $copySource) {
+        if (!$path -or ![IO.Directory]::Exists($path)) { continue }
+        foreach ($filename in $copyNames) { [IO.File]::Delete((Join-Path $path $filename)) }
+        [IO.Directory]::Delete($path)
+    }
     if ($originalAcl) { Set-Acl -LiteralPath $denied -AclObject $originalAcl }
     if ([IO.Directory]::Exists($denied)) {
         [IO.File]::Delete($deniedFile)
@@ -367,6 +453,7 @@ try {
     }
     if ([IO.Directory]::Exists($child)) { [IO.Directory]::Delete($child) }
     if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
+    if ($copyCleanupError) { throw $copyCleanupError }
     if ($labDirectory) {
         try {
             [IO.File]::Delete($dll)

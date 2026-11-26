@@ -8,20 +8,48 @@ typedef struct {
     BOOL background;
     volatile LONG *order;
     LONG position;
+    const volatile LONG *running;
+    BOOL yielded;
 } REQUEST;
 
 static DWORD WINAPI acquire(void *context)
 {
     REQUEST *request = context;
     IO_PERMIT permit;
-    request->result = io_budget_acquire(&permit, request->source, request->destination,
-                                        request->cancel, request->background);
+    if (request->running)
+        request->result = io_budget_acquire_background(&permit, request->source, request->running,
+                                                       &request->yielded);
+    else
+        request->result = io_budget_acquire(&permit, request->source, request->destination,
+                                            request->cancel, request->background);
     if (!request->result) {
         if (request->order)
             request->position = InterlockedIncrement(request->order);
         io_budget_release(&permit);
     }
     return 0;
+}
+
+static BOOL check_native_priority(IO_DEVICE device, BOOL age)
+{
+    IO_PERMIT native;
+    volatile LONG running = TRUE;
+    REQUEST request = { .source = device, .running = &running };
+    HANDLE thread;
+    DWORD observed;
+    io_budget_account_native(&native, device, device);
+    thread = CreateThread(NULL, 0, acquire, &request, 0, NULL);
+    if (!thread) {
+        io_budget_release(&native);
+        return FALSE;
+    }
+    observed = WaitForSingleObject(thread, age ? 2000 : 100);
+    InterlockedExchange(&running, FALSE);
+    WaitForSingleObject(thread, INFINITE);
+    io_budget_release(&native);
+    CloseHandle(thread);
+    return request.yielded && (age ? observed == WAIT_OBJECT_0 && request.result == ERROR_SUCCESS :
+                               observed == WAIT_TIMEOUT && request.result == ERROR_CANCELLED);
 }
 
 static BOOL check_request(IO_DEVICE a, IO_DEVICE b, BOOL blocked)
@@ -100,7 +128,8 @@ int main(void)
         io_budget_release(&held);
     }
     if (success)
-        success = check_request(a, a, FALSE) && check_priority(a, FALSE) && check_priority(a, TRUE);
+        success = check_request(a, a, FALSE) && check_priority(a, FALSE) && check_priority(a, TRUE) &&
+                  check_native_priority(b, FALSE) && check_native_priority(b, TRUE);
     if (!success)
         fputs("Disk limit, cross-device permit or cancellation failed.\n", stderr);
     return success ? 0 : 1;

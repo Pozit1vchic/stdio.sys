@@ -9,7 +9,12 @@ typedef struct {
     void (*first_entry)(void);
     FOLDER_WALK_PROGRESS progress;
     void *progress_context;
+    FOLDER_WALK_BUDGET *budget;
+    IO_PERMIT permit;
+    unsigned remaining;
 } WALK_PROPERTIES;
+
+enum { BUDGET_BATCH_FILES = 32 };
 
 static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
                            const FILE_ID_EXTD_DIR_INFO *entry)
@@ -33,14 +38,26 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
         return properties->progress ? properties->progress(properties->progress_context, &properties->totals) :
                ERROR_SUCCESS;
     }
+    if (properties->budget && !properties->remaining) {
+        BOOL yielded;
+        error = io_budget_acquire_background(&properties->permit, properties->budget->device,
+                                             properties->running, &yielded);
+        if (yielded)
+            ++properties->budget->yielded;
+        if (error)
+            return error;
+        properties->remaining = BUDGET_BATCH_FILES;
+    }
     error = tree_open_snapshot_entry(directory, entry, &file, &size);
-    if (error)
-        return error;
-    if (size != (ULONGLONG)entry->EndOfFile.QuadPart)
-        error = ERROR_RETRY;
-    else
-        error = folder_stream_allocation(file, properties->cluster, &allocation);
-    CloseHandle(file);
+    if (!error) {
+        if (size != (ULONGLONG)entry->EndOfFile.QuadPart)
+            error = ERROR_RETRY;
+        else
+            error = folder_stream_allocation(file, properties->cluster, &allocation);
+        CloseHandle(file);
+    }
+    if (properties->remaining && !--properties->remaining)
+        io_budget_release(&properties->permit);
     if (error)
         return error;
     if (allocation > MAXULONGLONG - properties->totals.allocated ||
@@ -54,12 +71,13 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
 }
 
 DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*first_entry)(void),
-                             FOLDER_WALK_PROGRESS progress, void *context, FOLDER_WALK_TOTALS *result)
+                             FOLDER_WALK_PROGRESS progress, void *context, FOLDER_WALK_BUDGET *budget,
+                             FOLDER_WALK_TOTALS *result)
 {
     wchar_t volume[MAX_PATH];
     DWORD sectors, sector_bytes, free_clusters, clusters;
     WALK_PROPERTIES properties = { .running = running, .first_entry = first_entry,
-                                   .progress = progress, .progress_context = context };
+                                   .progress = progress, .progress_context = context, .budget = budget };
     ULONGLONG id;
     TREE_RESULT totals;
     DWORD error;
@@ -70,6 +88,8 @@ DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*f
         return ERROR_INVALID_DATA;
     properties.cluster = sectors * sector_bytes;
     error = tree_snapshot(path, collect_entry, &properties, &id, &totals);
+    if (properties.remaining)
+        io_budget_release(&properties.permit);
     if (error)
         return error;
     if (running && !ReadAcquire(running))
@@ -88,7 +108,7 @@ __declspec(dllexport) DWORD WINAPI ShellFolderWalkCompare(PCWSTR path, ULONGLONG
                                                           ULONGLONG *allocated)
 {
     FOLDER_WALK_TOTALS totals;
-    DWORD error = folder_walk_properties(path, NULL, NULL, NULL, NULL, &totals);
+    DWORD error = folder_walk_properties(path, NULL, NULL, NULL, NULL, NULL, &totals);
     if (!error) {
         *files = totals.files;
         *folders = totals.folders;
