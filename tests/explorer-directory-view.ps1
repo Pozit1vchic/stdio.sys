@@ -2,11 +2,14 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [ValidateRange(1, 50000)][int]$FileCount = 10000,
     [ValidateRange(1, 30)][int]$Rounds = 5,
-    [switch]$Search
+    [switch]$Search,
+    [switch]$SearchRename,
+    [ValidateSet('FileSystem', 'Shell')][string]$RenameMethod = 'FileSystem'
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop.
 $ErrorActionPreference = 'Stop'
+if ($SearchRename) { $Search = $true }
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System;
@@ -66,13 +69,47 @@ $target = Join-Path $root 'large'
 $control = Join-Path $root 'empty'
 $shell = New-Object -ComObject Shell.Application
 $scope = [Windows.Automation.TreeScope]::Descendants
-$firstItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) 'fixture-00000.bin'
+$originalName = 'fixture-00000.bin'
+$renamedName = 'fixture-00000-renamed.bin'
+$firstItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) $originalName
+$renamedItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) $renamedName
 $statusGroup = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'System.StatusBarViewItemCount'
 $statusValue = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'PropertyValue'
 $searchEdit = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'SearchEditBox'
 $listPane = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdProperty) 'listview'
 $expectedCount = if ($Search) { 1 } else { $FileCount }
 $view = $null
+
+function Open-SearchBox {
+    $view.Navigate2($target)
+    $box = Wait-TestValue {
+        if ($view.Busy -or $view.Document.Folder.Self.Path -ne $target) { return }
+        $ui = [Windows.Automation.AutomationElement]::FromHandle($window)
+        $group = $ui.FindFirst($scope, $statusGroup)
+        if (!$group) { return }
+        $value = $group.FindFirst($scope, $statusValue)
+        if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$FileCount) {
+            $ui.FindFirst($scope, $searchEdit)
+        }
+    }
+    $box.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
+}
+
+function Read-RenameResult {
+    $ui = [Windows.Automation.AutomationElement]::FromHandle($window)
+    try {
+        $list = $ui.FindFirst($scope, $listPane)
+        if ($list) {
+            @{
+                Original = [bool]$list.FindFirst($scope, $firstItem)
+                Renamed = [bool]$list.FindFirst($scope, $renamedItem)
+            }
+        }
+    } catch [Windows.Automation.ElementNotAvailableException] {
+        # The view can replace a result while this sample is in progress.
+    }
+}
+
 try {
     [void][IO.Directory]::CreateDirectory($target)
     [void][IO.Directory]::CreateDirectory($control)
@@ -93,20 +130,7 @@ try {
         [void](Wait-TestValue {
             !$view.Busy -and $view.Document.Folder.Self.Path -eq $control
         })
-        if ($Search) {
-            $view.Navigate2($target)
-            $box = Wait-TestValue {
-                if ($view.Busy -or $view.Document.Folder.Self.Path -ne $target) { return }
-                $ui = [Windows.Automation.AutomationElement]::FromHandle($window)
-                $group = $ui.FindFirst($scope, $statusGroup)
-                if (!$group) { return }
-                $value = $group.FindFirst($scope, $statusValue)
-                if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$FileCount) {
-                    $ui.FindFirst($scope, $searchEdit)
-                }
-            }
-            $searchValue = $box.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
-        }
+        if ($Search) { $searchValue = Open-SearchBox }
         $explorer.Refresh()
         $cpuStart = $explorer.TotalProcessorTime.TotalMilliseconds
         $ioStart = [ExplorerViewOwner]::ReadIo($explorer.Handle)
@@ -136,7 +160,7 @@ try {
         }
         $explorer.Refresh()
         $ioEnd = [ExplorerViewOwner]::ReadIo($explorer.Handle)
-        [pscustomobject]@{
+        $result = [pscustomobject]@{
             Round = $round
             ExplorerPID = $owner
             NavigationStartUtc = $navigationStart.ToString('o')
@@ -153,11 +177,65 @@ try {
             ProcessOtherIo = $ioEnd.Other - $ioStart.Other
             ProcessReadBytes = $ioEnd.ReadBytes - $ioStart.ReadBytes
         }
+        if ($SearchRename) {
+            $originalPath = Join-Path $target $originalName
+            $renamedPath = Join-Path $target $renamedName
+            if ($RenameMethod -eq 'Shell') {
+                $renameItem = $shell.NameSpace($target).ParseName($originalName)
+                if (!$renameItem) { throw 'The Shell could not resolve the rename fixture.' }
+            }
+            $renameStart = [DateTime]::UtcNow
+            $renameClock = [Diagnostics.Stopwatch]::StartNew()
+            if ($RenameMethod -eq 'Shell') { $renameItem.Name = $renamedName }
+            else { [IO.File]::Move($originalPath, $renamedPath) }
+            if (![IO.File]::Exists($renamedPath) -or [IO.File]::Exists($originalPath)) {
+                throw 'The rename did not produce the expected fixture.'
+            }
+            $updatedMs = $null
+            do {
+                $visible = Read-RenameResult
+                if ($visible -and $visible.Renamed -and !$visible.Original) {
+                    $updatedMs = $renameClock.Elapsed.TotalMilliseconds
+                    break
+                }
+                Start-Sleep -Milliseconds 10
+            } while ($renameClock.ElapsedMilliseconds -lt 3000)
+            $renameClock.Stop()
+            $view.Navigate2($control)
+            [void](Wait-TestValue { !$view.Busy -and $view.Document.Folder.Self.Path -eq $control })
+            $searchValue = Open-SearchBox
+            $requeryStart = [DateTime]::UtcNow
+            $requeryClock = [Diagnostics.Stopwatch]::StartNew()
+            $searchValue.SetValue('fixture-00000')
+            $requeryMs = Wait-TestValue {
+                if ($view.LocationName -notlike '*fixture-00000*') { return }
+                $state = Read-RenameResult
+                if ($state -and $state.Renamed -and !$state.Original) {
+                    $requeryClock.Elapsed.TotalMilliseconds
+                }
+            }
+            $result | Add-Member -NotePropertyMembers @{
+                RenameMethod = $RenameMethod
+                RenameStartUtc = $renameStart.ToString('o')
+                RenameObservedMs = $(if ($null -ne $updatedMs) { [Math]::Round($updatedMs, 2) })
+                RenameObservationMs = [Math]::Round($renameClock.Elapsed.TotalMilliseconds, 2)
+                OldNameAtLastSample = $(if ($visible) { $visible.Original })
+                NewNameAtLastSample = $(if ($visible) { $visible.Renamed })
+                RequeryStartUtc = $requeryStart.ToString('o')
+                RequeryObservedMs = [Math]::Round($requeryMs, 2)
+            }
+        }
         $view.Navigate2($control)
+        if ($SearchRename) {
+            [void](Wait-TestValue { !$view.Busy -and $view.Document.Folder.Self.Path -eq $control })
+            [IO.File]::Move($renamedPath, $originalPath)
+        }
+        $result
     }
 } finally {
     if ($view) { $view.Quit() }
     if ([IO.Directory]::Exists($target)) {
+        if ($SearchRename) { [IO.File]::Delete((Join-Path $target $renamedName)) }
         for ($i = 0; $i -lt $FileCount; $i++) {
             [IO.File]::Delete((Join-Path $target ('fixture-{0:d5}.bin' -f $i)))
         }
