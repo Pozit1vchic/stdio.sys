@@ -19,7 +19,11 @@ typedef struct {
 DWORD tree_run(const wchar_t *path, BOOL remove, DWORD workers, TREE_RESULT *result);
 DWORD tree_list(const wchar_t *path);
 DWORD tree_find(const wchar_t *path, const wchar_t *needle, ULONGLONG *matches);
-typedef DWORD (*TREE_VISITOR)(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry);
+/* The directory handle and entry are borrowed for the duration of the callback. */
+typedef DWORD (*TREE_VISITOR)(void *context, HANDLE directory, ULONGLONG parent,
+                              const FILE_ID_EXTD_DIR_INFO *entry);
+DWORD tree_open_snapshot_entry(HANDLE directory, const FILE_ID_EXTD_DIR_INFO *entry,
+                               HANDLE *file, ULONGLONG *size);
 DWORD tree_snapshot(const wchar_t *path, TREE_VISITOR visitor, void *context,
                     ULONGLONG *root_id, TREE_RESULT *result);
 DWORD tree_snapshot_directory(const wchar_t *path, TREE_VISITOR visitor, void *context,

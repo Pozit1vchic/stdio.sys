@@ -181,6 +181,12 @@ static DWORD open_entry(HANDLE parent, const FILE_ID_EXTD_DIR_INFO *entry, ACCES
     return error;
 }
 
+DWORD tree_open_snapshot_entry(HANDLE directory, const FILE_ID_EXTD_DIR_INFO *entry,
+                               HANDLE *file, ULONGLONG *size)
+{
+    return open_entry(directory, entry, 0, SHARE_ALL, TRUE, file, size);
+}
+
 static void delete_job(DELETE_JOB *job, IO_DEVICE device)
 {
     HANDLE file;
@@ -288,7 +294,7 @@ static void walk_directory(WALK *walk, HANDLE directory, unsigned depth, ULONGLO
             if (dot_entry(entry))
                 continue;
             if (walk->visitor) {
-                DWORD error = walk->visitor(walk->context, parent, entry);
+                DWORD error = walk->visitor(walk->context, directory, parent, entry);
                 if (error) {
                     record_error(result, error);
                     free(buffer);

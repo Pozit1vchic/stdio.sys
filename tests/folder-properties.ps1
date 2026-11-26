@@ -20,7 +20,8 @@ using System.Threading;
 public static class FolderPropertiesProbe
 {
     [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
-    public delegate uint CompareWalk(string path, out ulong files, out ulong folders, out ulong bytes);
+    public delegate uint CompareWalk(string path, out ulong files, out ulong folders, out ulong bytes,
+        out ulong allocated);
 
     public static CompareWalk LoadWalk(string path)
     {
@@ -220,7 +221,7 @@ if ($CheckCancellation) {
     }
     return
 }
-$cases = 'plain', 'hardlink', 'sparse', 'junction', 'fileStream', 'directoryStream', 'accessDenied'
+$cases = 'plain', 'hardlink', 'sparse', 'junction', 'fileStream', 'directoryStream', 'accessDenied', 'deep'
 $ordinaryAllocation = $null
 foreach ($case in $cases) {
     $name = 'stdio-props-' + [guid]::NewGuid().ToString('N')
@@ -248,6 +249,18 @@ foreach ($case in $cases) {
             junction { New-Item -ItemType Junction -Path $junction -Target $nested | Out-Null }
             fileStream { Set-Content -LiteralPath $first -Stream payload -Value ('z' * 8000) -NoNewline }
             directoryStream { Set-Content -LiteralPath $nested -Stream payload -Value ('y' * 12000) -NoNewline }
+            deep {
+                $leaf = $nested
+                for ($level = 0; $level -lt 8; $level++) {
+                    $leaf = Join-Path $leaf "level-$level"
+                    [void][IO.Directory]::CreateDirectory($leaf)
+                }
+                $block = [byte[]]::new(16384)
+                for ($i = 0; $i -lt 512; $i++) {
+                    [IO.File]::WriteAllBytes((Join-Path $leaf ("payload-{0:d4}.bin" -f $i)), $block)
+                }
+                Set-Content -LiteralPath (Join-Path $leaf 'payload-0000.bin') -Stream payload -Value ('z' * 8000) -NoNewline
+            }
             accessDenied {
                 $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
                 $originalAcl = Get-Acl -LiteralPath $nested
@@ -272,16 +285,19 @@ foreach ($case in $cases) {
             hardlink { 40977 }
             sparse { 8409105 }
             accessDenied { 17 }
+            deep { 20497 + 512 * 16384 }
             default { 20497 }
         }
         $expectedFiles = switch ($case) {
             hardlink { 3 }
             sparse { 3 }
             accessDenied { 1 }
+            deep { 514 }
             default { 2 }
         }
+        $expectedFolders = if ($case -eq 'deep') { 9 } else { 1 }
         $counts = @([regex]::Matches($fields[13087], '[0-9]+') | ForEach-Object { [int]$_.Value })
-        if ($logical -ne $expectedBytes -or ($counts -join ',') -ne "$expectedFiles,1") {
+        if ($logical -ne $expectedBytes -or ($counts -join ',') -ne "$expectedFiles,$expectedFolders") {
             throw "Unexpected native totals for ${case}: $logical bytes, $($fields[13087])"
         }
         $expectedHits = if ($lab -and !$LabPassThrough) { $expectedFiles } else { 0 }
@@ -294,8 +310,10 @@ foreach ($case in $cases) {
             [uint64]$walkFiles = [uint64]::MaxValue
             [uint64]$walkFolders = [uint64]::MaxValue
             [uint64]$walkBytes = [uint64]::MaxValue
+            [uint64]$walkAllocated = [uint64]::MaxValue
             $clock = [Diagnostics.Stopwatch]::StartNew()
-            $walkError = $walk.Invoke($path, [ref]$walkFiles, [ref]$walkFolders, [ref]$walkBytes)
+            $walkError = $walk.Invoke($path, [ref]$walkFiles, [ref]$walkFolders, [ref]$walkBytes,
+                [ref]$walkAllocated)
             $walkMs = $clock.Elapsed.TotalMilliseconds
             $expectedError = switch ($case) {
                 junction { 50 }
@@ -303,11 +321,13 @@ foreach ($case in $cases) {
                 default { 0 }
             }
             if ($walkError -ne $expectedError) { throw "Unexpected walk status for ${case}: $walkError" }
-            if (!$walkError -and ($walkFiles -ne $expectedFiles -or $walkFolders -ne 1 -or $walkBytes -ne $logical)) {
+            if (!$walkError -and ($walkFiles -ne $expectedFiles -or $walkFolders -ne $expectedFolders -or
+                $walkBytes -ne $logical -or $walkAllocated -ne $allocated)) {
                 throw "Recursive walk disagreed with Shell for $case."
             }
             if ($walkError -and ($walkFiles -ne [uint64]::MaxValue -or
-                $walkFolders -ne [uint64]::MaxValue -or $walkBytes -ne [uint64]::MaxValue)) {
+                $walkFolders -ne [uint64]::MaxValue -or $walkBytes -ne [uint64]::MaxValue -or
+                $walkAllocated -ne [uint64]::MaxValue)) {
                 throw "Recursive walk returned partial totals for $case."
             }
         }
@@ -321,6 +341,11 @@ foreach ($case in $cases) {
             }
             accessDenied {
                 if ($allocated -ge $ordinaryAllocation) { throw 'Shell included the denied file allocation.' }
+            }
+            deep {
+                if ($allocated -lt $ordinaryAllocation + 512 * 16384) {
+                    throw 'Shell did not include allocation from the deep tree.'
+                }
             }
             default {
                 if ($allocated -ne $ordinaryAllocation) { throw "Unexpected native allocation for $case" }

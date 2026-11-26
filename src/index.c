@@ -643,8 +643,10 @@ static DWORD snapshot_file(INDEX *index, ULONGLONG parent, DWORDLONG id, const F
     return ERROR_SUCCESS;
 }
 
-static DWORD snapshot_entry(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry)
+static DWORD snapshot_entry(void *context, HANDLE directory, ULONGLONG parent,
+                            const FILE_ID_EXTD_DIR_INFO *entry)
 {
+    UNREFERENCED_PARAMETER(directory);
     INDEX *index = context;
     DWORDLONG id;
     memcpy(&id, entry->FileId.Identifier, sizeof(id));
@@ -760,8 +762,10 @@ typedef struct {
     size_t directories_seen;
 } DIRECTORY_REFRESH;
 
-static DWORD refresh_child_entry(void *context, ULONGLONG parent, const FILE_ID_EXTD_DIR_INFO *entry)
+static DWORD refresh_child_entry(void *context, HANDLE directory, ULONGLONG parent,
+                                 const FILE_ID_EXTD_DIR_INFO *entry)
 {
+    UNREFERENCED_PARAMETER(directory);
     DIRECTORY_REFRESH *update = context;
     INDEX *index = update->index;
     DWORDLONG id;
