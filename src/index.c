@@ -1206,6 +1206,21 @@ done:
 }
 
 
+static BOOL condition_matches_input(ICondition *condition, PCWSTR component, size_t length)
+{
+    IRichChunk *term = NULL;
+    PWSTR text = NULL;
+    BOOL matches = FALSE;
+    if (SUCCEEDED(ICondition_GetInputTerms(condition, NULL, NULL, &term)) && term) {
+        /* The comparison value can carry Shell word-break metadata. */
+        if (SUCCEEDED(IRichChunk_GetData(term, NULL, NULL, &text, NULL)) && text)
+            matches = wcslen(text) == length && !wmemcmp(component, text, length);
+        CoTaskMemFree(text);
+        IRichChunk_Release(term);
+    }
+    return matches;
+}
+
 HRESULT directory_search_condition(DIRECTORY_SEARCH *search, PCWSTR query, ICondition *condition,
                                    IShellItemArray **items)
 {
@@ -1226,7 +1241,8 @@ HRESULT directory_search_condition(DIRECTORY_SEARCH *search, PCWSTR query, ICond
     hr = ICondition_GetComparisonInfo(condition, &property, &operation, NULL);
     if (SUCCEEDED(hr)) {
         if (operation == COP_EQUAL && property &&
-            CompareStringOrdinal(property, -1, L"System.FileName", -1, TRUE) == CSTR_EQUAL) {
+            CompareStringOrdinal(property, -1, L"System.FileName", -1, TRUE) == CSTR_EQUAL &&
+            condition_matches_input(condition, component, name_length)) {
             wmemcpy(name, component, name_length);
             name[name_length] = 0;
             hr = search_exact_name(search, name, items);

@@ -41,12 +41,12 @@ static BOOL shell_results_are(IShellItemArray *items, PCWSTR first, PCWSTR secon
     return !first && !second;
 }
 
-static HRESULT query_shell_index(IQueryParser *parser, DIRECTORY_SEARCH *search, PCWSTR query,
-                                 IShellItemArray **items)
+static HRESULT query_shell_index_as(IQueryParser *parser, DIRECTORY_SEARCH *search, PCWSTR query,
+                                    PCWSTR parsed_query, IShellItemArray **items)
 {
     IQuerySolution *solution;
     ICondition *condition = NULL;
-    HRESULT hr = IQueryParser_Parse(parser, query, NULL, &solution);
+    HRESULT hr = IQueryParser_Parse(parser, parsed_query, NULL, &solution);
     if (SUCCEEDED(hr)) {
         hr = IQuerySolution_GetQuery(solution, &condition, NULL);
         if (SUCCEEDED(hr))
@@ -56,6 +56,12 @@ static HRESULT query_shell_index(IQueryParser *parser, DIRECTORY_SEARCH *search,
         IQuerySolution_Release(solution);
     }
     return hr;
+}
+
+static HRESULT query_shell_index(IQueryParser *parser, DIRECTORY_SEARCH *search, PCWSTR query,
+                                 IShellItemArray **items)
+{
+    return query_shell_index_as(parser, search, query, query, items);
 }
 
 static BOOL directory_search_test(PCWSTR root, PCWSTR original)
@@ -83,6 +89,8 @@ static BOOL directory_search_test(PCWSTR root, PCWSTR original)
         query_shell_index(parser, search, L"System.FileName:~\"тест\"", &items) != E_NOTIMPL ||
         query_shell_index(parser, search, L"System.FileName:=\"тест.txt\" AND System.Size:>1",
                           &items) != E_NOTIMPL ||
+        query_shell_index_as(parser, search, exact, L"System.FileName:=\"different.txt\"",
+                             &items) != E_NOTIMPL ||
         !shell_results_are(items, original, same_name))
         goto done;
     IShellItemArray_Release(items);

@@ -528,3 +528,11 @@ wpr -stop D:\Lab\stdio-one-run.etl
 | Замена запроса | 10 | 416,22 | 436,06 | 585,93 | 134,29 | 83,28 |
 
 Диапазоны до счётчика для одиночного запроса 259,61–319,26 мс и 165,53–305,90 мс соответственно. При замене запроса диапазоны 269,12–287,00 мс и 428,85–452,57 мс. В режиме 100 мс изменились два таймера на пару запросов, при 10 мс — один. Во всех прогонах с заменой контроль через 600 мс подтвердил наличие последнего результата и отсутствие предыдущего. Замер включает работу UI Automation, а пиковый рабочий набор накапливается за время жизни процесса. Режим 10 мс ухудшил отзывчивость при замене запроса и остаётся доступен только по явному выбору в лаборатории. Данные находятся в `build/explorer-search-timer-short.csv` и `build/explorer-search-timer-short-replacement.csv`.
+
+Два контрольных прогона штатного точного поиска с отладчиком, 1024 файла и вложенная папка, показали следующий путь:
+
+- Поток окна создаёт штатную коллекцию через `CDefView::_CreateCollection → CItemCollectionFactory::CreateItemCollection`.
+- Фоновый код вызывает `CGrepQuery::_Initialize` из `CGrepRowset::_ExecuteCommandSearch`. При чтении строк `CRowsetEnumeration → CGrepRowset::GetRowsAt → CGrepQuery::CrawlForNextItemImpl` вызывает `_EnumFolder` и `_EvaluateItem`. Для дескриптора тестового каталога `_EnumFolder` дошёл до `CFSFolder::EnumObjects → NtQueryDirectoryFile`.
+- `CItemCollection::OnResultsAdded` получил уведомление из `CResultSetManager::_BroadcastResultsAdded` в фоновом пути `CFirstPageResults::_EnumerateCollection → CItemCollection::GetItem`. Отдельный вызов `NtQueryDirectoryFileEx` на потоке окна относился к формированию имени поисковой папки и был замечен до создания коллекции.
+
+Точка `_EnumFolder` позволяет исследовать передачу кандидатов из индекса перед штатной фильтрацией и формированием строк. Для такого эксперимента ещё нужно связать экземпляр запроса с подтверждённым условием и каталогом, проверить переходы во вложенные папки и сохранить штатные уведомления. Эти прогоны выполнены с отладчиком и подтверждают маршрут, поэтому их время не включено в сравнение производительности. Стек сохранён в `build/explorer-search-provider-route.txt` и `build/explorer-search-shape-route.txt`.
