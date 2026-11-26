@@ -62,7 +62,8 @@ static DWORD report_walk(void *context, const FOLDER_WALK_TOTALS *totals)
     WALK_PROGRESS *progress = context;
     ULONGLONG now = GetTickCount64();
     DWORD error;
-    if (now < progress->next_update)
+    if (now < progress->next_update &&
+        !(pause_after_progress && totals->files && !ReadAcquire(&pause_claimed)))
         return ERROR_SUCCESS;
     progress->next_update = now + 100;
     error = publish_walk(progress, totals);

@@ -8,6 +8,7 @@ param(
     [switch]$DeniedDirectory,
     [switch]$CheckWalkCancellation,
     [switch]$CheckWalkProgress,
+    [ValidateRange(0, 16)][int]$Depth = 0,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
@@ -164,7 +165,9 @@ $sentinel = Join-Path $outside 'sentinel.bin'
 $denied = Join-Path $child 'denied'
 $deniedFile = Join-Path $denied 'excluded.bin'
 $originalAcl = $null
-$expectedFolders = [int][bool]$DeniedDirectory
+$expectedFolders = $Depth + [int][bool]$DeniedDirectory
+$fixtureDirectories = [Collections.Generic.List[string]]::new()
+$fileDirectory = $child
 $expectedBytes = [uint64]16384 * $FileCount
 $before = @(Get-Process explorer | Select-Object -ExpandProperty Id)
 $desktop = [Windows.Automation.AutomationElement]::RootElement
@@ -177,9 +180,14 @@ $labDirectory = $null
 
 try {
     [void][IO.Directory]::CreateDirectory($child)
+    for ($level = 0; $level -lt $Depth; $level++) {
+        $fileDirectory = Join-Path $fileDirectory "level-$level"
+        [void][IO.Directory]::CreateDirectory($fileDirectory)
+        $fixtureDirectories.Add($fileDirectory)
+    }
     $payload = [byte[]]::new(16384)
     for ($i = 0; $i -lt $FileCount; $i++) {
-        [IO.File]::WriteAllBytes((Join-Path $child "$i.bin"), $payload)
+        [IO.File]::WriteAllBytes((Join-Path $fileDirectory "$i.bin"), $payload)
     }
     if ($Junction) {
         [void][IO.Directory]::CreateDirectory($outside)
@@ -395,6 +403,7 @@ try {
         PartialBytes = $partialBytes
         VerifiedDisable = [bool]$dll
         FileCount = $FileCount
+        Depth = $Depth
         FinalFieldsMilliseconds = [Math]::Round($elapsed, 2)
         ProcessCpuMilliseconds = [Math]::Round($cpu, 2)
         ProcessPeakWorkingSetBytes = $peakWorkingSet
@@ -425,7 +434,10 @@ try {
         [IO.Directory]::Delete($outside)
     }
     for ($i = 0; $i -lt $FileCount; $i++) {
-        [IO.File]::Delete((Join-Path $child "$i.bin"))
+        [IO.File]::Delete((Join-Path $fileDirectory "$i.bin"))
+    }
+    for ($level = $fixtureDirectories.Count - 1; $level -ge 0; $level--) {
+        [IO.Directory]::Delete($fixtureDirectories[$level])
     }
     if ([IO.Directory]::Exists($child)) { [IO.Directory]::Delete($child) }
     if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
