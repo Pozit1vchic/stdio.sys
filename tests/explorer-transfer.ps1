@@ -2,11 +2,14 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [ValidateRange(1, 4096)][int]$FileCount = 256,
     [ValidateRange(1, 20)][int]$Rounds = 5,
-    [switch]$Recycle
+    [switch]$Recycle,
+    [switch]$ClipboardVerbs
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop and local NTFS.
 $ErrorActionPreference = 'Stop'
+if ($Recycle -and $ClipboardVerbs) { throw 'Choose recycle or clipboard transfer.' }
+if ($ClipboardVerbs) { Add-Type -AssemblyName System.Windows.Forms }
 Add-Type @"
 using System;
 using System.ComponentModel;
@@ -15,6 +18,44 @@ using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 public static class TransferProbe
 {
+    [DllImport("ole32.dll")]
+    private static extern int OleInitialize(IntPtr reserved);
+    [DllImport("ole32.dll")]
+    private static extern void OleUninitialize();
+    [DllImport("ole32.dll")]
+    private static extern int OleGetClipboard(out IntPtr data);
+    [DllImport("ole32.dll")]
+    private static extern int OleSetClipboard(IntPtr data);
+    [DllImport("ole32.dll")]
+    private static extern int OleIsCurrentClipboard(IntPtr data);
+    [DllImport("user32.dll")]
+    public static extern uint GetClipboardSequenceNumber();
+
+    public sealed class ClipboardBackup : IDisposable
+    {
+        private IntPtr saved;
+        public ClipboardBackup()
+        {
+            Marshal.ThrowExceptionForHR(OleInitialize(IntPtr.Zero));
+            try { Marshal.ThrowExceptionForHR(OleGetClipboard(out saved)); }
+            catch { OleUninitialize(); throw; }
+        }
+        public bool Restore(uint expectedSequence)
+        {
+            if (GetClipboardSequenceNumber() != expectedSequence) return false;
+            int result = OleSetClipboard(saved);
+            if (result == unchecked((int)0x800401D4) && OleIsCurrentClipboard(saved) == 0)
+                return true;
+            Marshal.ThrowExceptionForHR(result);
+            return true;
+        }
+        public void Dispose()
+        {
+            if (saved != IntPtr.Zero) Marshal.Release(saved);
+            saved = IntPtr.Zero;
+            OleUninitialize();
+        }
+    }
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
 
@@ -53,6 +94,8 @@ $recycleName = 'stdio-recycle-' + [guid]::NewGuid().ToString('N')
 $recyclePath = Join-Path $target $recycleName
 $shell = New-Object -ComObject Shell.Application
 $view = $null
+$clipboard = $null
+$clipboardSequence = $null
 $payloadSize = 65536
 $bytes = [byte[]]::new($payloadSize)
 [Random]::new(12345).NextBytes($bytes)
@@ -113,6 +156,7 @@ try {
         return
     }
     $operations = 'Copy', 'Move'
+    if ($ClipboardVerbs) { $clipboard = [TransferProbe+ClipboardBackup]::new() }
     for ($round = 1; $round -le $Rounds; $round++) {
         foreach ($operation in $operations) {
             $source = Join-Path $root "$operation-$round"
@@ -127,11 +171,37 @@ try {
             $sourceId = [TransferProbe]::Identity($firstSource)
             $expectedHash = (Get-FileHash -LiteralPath $firstSource).Hash
             Set-Content -LiteralPath $firstSource -Stream stdio-test -Value 'native-transfer' -NoNewline
+            if ($clipboard) {
+                if ($null -ne $clipboardSequence -and
+                    [TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
+                    throw 'The clipboard changed outside the test.'
+                }
+                $sourceFolder = $view.Document.Folder.ParentFolder
+                $item = $sourceFolder.ParseName([IO.Path]::GetFileName($source))
+                if (!$item) { throw 'The source fixture did not resolve in Explorer.' }
+                $verb = if ($operation -eq 'Copy') { 'copy' } else { 'cut' }
+                $priorSequence = [TransferProbe]::GetClipboardSequenceNumber()
+                $item.InvokeVerb($verb)
+                $clipboardSequence = Wait-Observed {
+                    $sequence = [TransferProbe]::GetClipboardSequenceNumber()
+                    if ($sequence -eq $priorSequence) { return }
+                    $pathsOnClipboard = [Windows.Forms.Clipboard]::GetFileDropList()
+                    if ($pathsOnClipboard.Count -eq 1 -and $pathsOnClipboard[0] -eq $source) {
+                        [TransferProbe]::GetClipboardSequenceNumber()
+                    }
+                } "Explorer did not set the clipboard for $verb."
+            }
             $explorer.Refresh()
             $cpu = $explorer.TotalProcessorTime.TotalMilliseconds
             $started = [DateTime]::UtcNow
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            if ($operation -eq 'Copy') { $destination.CopyHere($source) }
+            if ($clipboard) {
+                if ([TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
+                    throw 'The clipboard changed before paste.'
+                }
+                $destination.Self.InvokeVerb('paste')
+            }
+            elseif ($operation -eq 'Copy') { $destination.CopyHere($source) }
             else { $destination.MoveHere($source) }
 
             $elapsed = Wait-Observed {
@@ -159,8 +229,18 @@ try {
             if ($operation -eq 'Copy' -and [IO.Directory]::GetFiles($source).Count -ne $FileCount) {
                 throw 'Copy changed the source tree.'
             }
+            if ($clipboard -and $operation -eq 'Move' -and
+                [TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
+                $afterPaste = [TransferProbe]::GetClipboardSequenceNumber()
+                if ([Windows.Forms.Clipboard]::GetDataObject().GetFormats().Count -ne 0 -or
+                    [TransferProbe]::GetClipboardSequenceNumber() -ne $afterPaste) {
+                    throw 'The clipboard changed during paste.'
+                }
+                $clipboardSequence = $afterPaste
+            }
             [pscustomobject]@{
                 Operation = $operation
+                EntryPoint = $(if ($clipboard) { 'ClipboardVerbs' } else { 'FolderAutomation' })
                 Round = $round
                 ExplorerPID = $owner
                 StartedUtc = $started.ToString('o')
@@ -176,6 +256,16 @@ try {
         [array]::Reverse($operations)
     }
 } finally {
+    $clipboardError = $null
+    if ($clipboard) {
+        try {
+            if ($null -ne $clipboardSequence -and !$clipboard.Restore($clipboardSequence)) {
+                Write-Verbose 'Clipboard changed after the test copy/cut and was left alone.'
+            }
+        } catch {
+            $clipboardError = $_
+        } finally { $clipboard.Dispose() }
+    }
     if ($view) { $view.Quit() }
     if ([IO.Directory]::Exists($root)) {
         $resolved = (Resolve-Path -LiteralPath $root).ProviderPath
@@ -185,4 +275,5 @@ try {
         }
         [IO.Directory]::Delete($resolved, $true)
     }
+    if ($clipboardError) { throw $clipboardError }
 }
