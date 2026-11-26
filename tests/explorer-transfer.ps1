@@ -5,6 +5,7 @@ param(
     [switch]$Recycle,
     [switch]$ClipboardVerbs,
     [switch]$CheckCollision,
+    [string]$LabCopyDll,
     [ValidateSet('Both', 'Copy', 'Move')][string]$Operation = 'Both'
 )
 
@@ -14,6 +15,12 @@ if ($Recycle -and $ClipboardVerbs) { throw 'Choose recycle or clipboard transfer
 if ($Recycle -and $Operation -ne 'Both') { throw 'The operation filter applies to transfers only.' }
 if ($CheckCollision -and ($Recycle -or $ClipboardVerbs -or $Operation -ne 'Both')) {
     throw 'The collision control uses clipboard copy and paste.'
+}
+if ($LabCopyDll) {
+    if (!$CheckCollision -and (!$ClipboardVerbs -or $Operation -ne 'Copy')) {
+        throw 'Copy accounting requires clipboard copy or the collision control.'
+    }
+    Add-Type -Path (Join-Path $PSScriptRoot 'explorer-process-probe.cs')
 }
 if ($ClipboardVerbs -or $CheckCollision) { Add-Type -AssemblyName System.Windows.Forms }
 Add-Type @"
@@ -107,6 +114,15 @@ function Set-TransferClipboard($Item, [string]$Path, [string]$Verb) {
     } "Explorer did not set the clipboard for $Verb."
 }
 
+function Wait-CopyAccounting([long]$Before, [int]$Minimum) {
+    if (!$labReady) { return }
+    Wait-Observed {
+        $now = [ExplorerProcessProbe]::LabCommand([IntPtr]$view.HWND, $owner, $labPath, 21,
+                                                'stdio.lab.copy-accounted') - $Before
+        if ($now -ge $Minimum) { $now }
+    } 'Explorer did not account for the expected native copies.'
+}
+
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $root = Join-Path $parent ('stdio-transfer-' + [guid]::NewGuid().ToString('N'))
 $target = Join-Path $root 'destination'
@@ -116,6 +132,7 @@ $shell = New-Object -ComObject Shell.Application
 $view = $null
 $clipboard = $null
 $clipboardSequence = $null
+$labReady = $false
 $payloadSize = 65536
 $bytes = [byte[]]::new($payloadSize)
 [Random]::new(12345).NextBytes($bytes)
@@ -132,11 +149,29 @@ try {
     [void][TransferProbe]::GetWindowThreadProcessId([IntPtr]$view.HWND, [ref]$owner)
     if (!$owner -or $owner -in $existing) { throw 'The transfer window was not isolated.' }
     $explorer = Get-Process -Id $owner
+    if ($LabCopyDll) {
+        if ($explorer.Path -ne (Join-Path $env:windir 'explorer.exe')) {
+            throw 'The test view does not belong to Windows Explorer.'
+        }
+        $labDirectory = Join-Path $parent ('stdio-copy-lab-' + [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($labDirectory)
+        $labPath = Join-Path $labDirectory 'stdio_shell_lab.dll'
+        [IO.File]::Copy((Resolve-Path -LiteralPath $LabCopyDll).ProviderPath, $labPath)
+        $image = $explorer.Modules | Where-Object ModuleName -eq windows.storage.dll
+        $copyCall = [IntPtr]::Add($image.BaseAddress, 0x34AE60)
+        $originalCopy = [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $copyCall, 7))
+        $install = [ExplorerProcessProbe]::LabCommand([IntPtr]$view.HWND, $owner, $labPath, 20, 'stdio.lab.copy-install')
+        if ($install) { throw "Copy accounting refused to install, Win32 error $install." }
+        $labReady = $true
+    }
     $patcher = $explorer.Modules | Where-Object ModuleName -eq ExplorerPatcher.amd64.dll
     $destination = $view.Document.Folder
     if ($CheckCollision) {
         $clipboard = [TransferProbe+ClipboardBackup]::new()
         for ($round = 1; $round -le $Rounds; $round++) {
+            if ($labReady) {
+                $before = [ExplorerProcessProbe]::LabCommand([IntPtr]$view.HWND, $owner, $labPath, 21, 'stdio.lab.copy-accounted')
+            }
             if ($null -ne $clipboardSequence -and
                 [TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
                 throw 'The clipboard changed outside the test.'
@@ -207,6 +242,7 @@ try {
                 PrivateBytes = $explorer.PrivateMemorySize64
                 NoncollidingFilesCopied = $markers.Count
                 CollidingFilesPreserved = $true
+                AccountedNativeCalls = Wait-CopyAccounting $before $markers.Count
             }
         }
         return
@@ -257,6 +293,9 @@ try {
     if ($ClipboardVerbs) { $clipboard = [TransferProbe+ClipboardBackup]::new() }
     for ($round = 1; $round -le $Rounds; $round++) {
         foreach ($transfer in $operations) {
+            if ($labReady) {
+                $before = [ExplorerProcessProbe]::LabCommand([IntPtr]$view.HWND, $owner, $labPath, 21, 'stdio.lab.copy-accounted')
+            }
             $source = Join-Path $root "$transfer-$round"
             $output = Join-Path $target "$transfer-$round"
             [void][IO.Directory]::CreateDirectory($source)
@@ -327,6 +366,8 @@ try {
                 }
                 $clipboardSequence = $afterPaste
             }
+            $accounted = Wait-CopyAccounting $before $FileCount
+            if ($labReady -and $accounted -ne $FileCount) { throw "Expected $FileCount native copies, saw $accounted." }
             [pscustomobject]@{
                 Operation = $transfer
                 EntryPoint = $(if ($clipboard) { 'ClipboardVerbs' } else { 'FolderAutomation' })
@@ -343,11 +384,21 @@ try {
                 ExplorerCpuMs = [Math]::Round($cpuMs, 2)
                 PeakWorkingSetBytes = $explorer.PeakWorkingSet64
                 PrivateBytes = $explorer.PrivateMemorySize64
+                AccountedNativeCalls = $accounted
             }
         }
         [array]::Reverse($operations)
     }
 } finally {
+    $labCleanupError = $null
+    if ($labReady) {
+        try {
+            $restored = [ExplorerProcessProbe]::LabCommand([IntPtr]$view.HWND, $owner, $labPath, 22, 'stdio.lab.copy-remove')
+            if ($restored -or [BitConverter]::ToString([ExplorerProcessProbe]::ReadCode($owner, $copyCall, 7)) -ne $originalCopy) {
+                throw "Could not restore native copy call, Win32 error $restored."
+            }
+        } catch { $labCleanupError = $_ }
+    }
     $clipboardError = $null
     if ($clipboard) {
         try {
@@ -359,6 +410,16 @@ try {
         } finally { $clipboard.Dispose() }
     }
     if ($view) { $view.Quit() }
+    if ($labPath -and [IO.Directory]::Exists($labDirectory)) {
+        try {
+            [IO.File]::Delete($labPath)
+            [IO.Directory]::Delete($labDirectory)
+        } catch [IO.IOException] {
+            Write-Verbose "Isolated Explorer still has the lab image mapped: $labPath"
+        } catch [UnauthorizedAccessException] {
+            Write-Verbose "Isolated Explorer still has the lab image mapped: $labPath"
+        }
+    }
     if ([IO.Directory]::Exists($root)) {
         $resolved = (Resolve-Path -LiteralPath $root).ProviderPath
         if ([IO.Path]::GetDirectoryName($resolved) -ne $parent -or
@@ -368,4 +429,5 @@ try {
         [IO.Directory]::Delete($resolved, $true)
     }
     if ($clipboardError) { throw $clipboardError }
+    if ($labCleanupError) { throw $labCleanupError }
 }

@@ -127,6 +127,14 @@ DWORD io_budget_acquire(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destinati
     return error;
 }
 
+void io_budget_account_native(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destination)
+{
+    AcquireSRWLockExclusive(&lock);
+    *permit = (IO_PERMIT){ active, source, destination };
+    active = permit;
+    ReleaseSRWLockExclusive(&lock);
+}
+
 void io_budget_release(IO_PERMIT *permit)
 {
     IO_PERMIT **link;

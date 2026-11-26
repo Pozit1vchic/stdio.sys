@@ -1,6 +1,8 @@
 #include "folder_streams.h"
 #include "folder_walk_lab.h"
 #include "exact_name_query.h"
+#include "engine.h"
+#include "io_budget.h"
 #include <bcrypt.h>
 #include <stdint.h>
 #include <string.h>
@@ -159,14 +161,10 @@ static HRESULT read_streams(PCWSTR path, SHELL_STREAM_VISITOR *visitor)
     return S_OK;
 }
 
-static BOOL expected_image(HMODULE shell)
+static BOOL image_matches(HMODULE shell, const BYTE digest[32])
 {
-    static const BYTE digest[32] = {
-        0xC8,0x3C,0xC7,0xEE,0x08,0xE1,0xB3,0x38,0x0E,0x53,0xF8,0xA7,0xB0,0x0A,0x0E,0xA8,
-        0x4A,0xCD,0x2B,0xBD,0xDE,0x24,0x02,0x23,0xF8,0x4B,0xD3,0x2A,0xE8,0x68,0xA0,0x9F
-    };
     wchar_t path[MAX_PATH];
-    BYTE sum[sizeof(digest)], buffer[8192];
+    BYTE sum[32], buffer[8192];
     BCRYPT_ALG_HANDLE algorithm = NULL;
     BCRYPT_HASH_HANDLE hash = NULL;
     HANDLE file;
@@ -196,6 +194,15 @@ static BOOL expected_image(HMODULE shell)
         BCryptCloseAlgorithmProvider(algorithm, 0);
     CloseHandle(file);
     return valid;
+}
+
+static BOOL expected_image(HMODULE shell)
+{
+    static const BYTE digest[32] = {
+        0xC8,0x3C,0xC7,0xEE,0x08,0xE1,0xB3,0x38,0x0E,0x53,0xF8,0xA7,0xB0,0x0A,0x0E,0xA8,
+        0x4A,0xCD,0x2B,0xBD,0xDE,0x24,0x02,0x23,0xF8,0x4B,0xD3,0x2A,0xE8,0x68,0xA0,0x9F
+    };
+    return image_matches(shell, digest);
 }
 
 typedef HRESULT (*SEARCH_NOTIFY)(void *, PCWSTR, PCWSTR, DWORD);
@@ -341,6 +348,142 @@ static DWORD remove_search_timer(void)
     memcpy(&original_timer, search_timer_code + 3, sizeof(original_timer));
     /* Keep the pinned stub valid for any call already in progress. */
     return write_search_operands(notify, timer, original_notify, original_timer);
+}
+
+typedef HRESULT (WINAPI *NATIVE_COPY)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS *);
+enum { COPY_CALL = 0x34AE60, COPY_SLOT = 0x6E50D8 };
+static const BYTE copy_code[] = {0x48, 0xFF, 0x15, 0x71, 0xA2, 0x39, 0x00};
+static NATIVE_COPY native_copy;
+static BYTE *copy_call;
+static int32_t copy_operand;
+static HWND copy_window;
+static DWORD copy_ui_thread;
+static volatile LONG copy_enabled, copy_accounted;
+static _Thread_local struct {
+    wchar_t root[MAX_PATH];
+    IO_DEVICE device;
+} copy_scope;
+
+static BOOL copy_fixture_device(PCWSTR source, PCWSTR destination, IO_DEVICE *device)
+{
+    const wchar_t *marker = wcsstr(source, L"\\stdio-transfer-");
+    const wchar_t *end = marker ? wcschr(marker + 1, L'\\') : NULL;
+    size_t length;
+    if (!end)
+        return FALSE;
+    length = (size_t)(end - source);
+    if (length >= ARRAYSIZE(copy_scope.root) || source[1] != L':' || source[2] != L'\\' ||
+        wcsncmp(source, destination, length) || destination[length] != L'\\')
+        return FALSE;
+    if (wcsncmp(copy_scope.root, source, length) || copy_scope.root[length]) {
+        wmemcpy(copy_scope.root, source, length);
+        copy_scope.root[length] = 0;
+        copy_scope.device = io_device_for_path(copy_scope.root, storage_workers(copy_scope.root));
+    }
+    *device = copy_scope.device;
+    return device->known;
+}
+
+static HRESULT WINAPI account_copy(PCWSTR source, PCWSTR destination, COPYFILE2_EXTENDED_PARAMETERS *parameters)
+{
+    IO_DEVICE device;
+    IO_PERMIT permit;
+    HRESULT result;
+    DWORD last = GetLastError();
+    if (!ReadAcquire(&copy_enabled) || GetCurrentThreadId() == copy_ui_thread || !source || !destination ||
+        !copy_fixture_device(source, destination, &device)) {
+        SetLastError(last);
+        return native_copy(source, destination, parameters);
+    }
+    io_budget_account_native(&permit, device, device);
+    SetLastError(last);
+    result = native_copy(source, destination, parameters);
+    last = GetLastError();
+    io_budget_release(&permit);
+    InterlockedIncrement(&copy_accounted);
+    SetLastError(last);
+    return result;
+}
+
+static DWORD write_copy_operand(int32_t value)
+{
+    DWORD old, ignore;
+    BOOL flushed, restored;
+    if (!VirtualProtect(copy_call, sizeof(copy_code), PAGE_EXECUTE_READWRITE, &old))
+        return GetLastError();
+    _InterlockedExchange((volatile LONG *)(copy_call + 3), value);
+    flushed = FlushInstructionCache(GetCurrentProcess(), copy_call, sizeof(copy_code));
+    restored = VirtualProtect(copy_call, sizeof(copy_code), old, &ignore);
+    return flushed && restored ? ERROR_SUCCESS : ERROR_INVALID_STATE;
+}
+
+static DWORD remove_copy_accounting(void)
+{
+    int32_t current, stock_operand;
+    InterlockedExchange(&copy_enabled, FALSE);
+    if (!memcmp(copy_call, copy_code, sizeof(copy_code)))
+        return ERROR_SUCCESS;
+    memcpy(&current, copy_call + 3, sizeof(current));
+    if (memcmp(copy_call, copy_code, 3) || current != copy_operand)
+        return ERROR_REVISION_MISMATCH;
+    memcpy(&stock_operand, copy_code + 3, sizeof(stock_operand));
+    return write_copy_operand(stock_operand);
+}
+
+static DWORD install_copy_accounting(HWND window)
+{
+    static const BYTE digest[32] = {
+        0x81,0x39,0x1D,0x8A,0x95,0x41,0xDA,0x55,0x85,0x7F,0x81,0x1C,0x0C,0xAA,0xA4,0x8D,
+        0x28,0x9F,0xC9,0x16,0x1A,0xED,0x8E,0x05,0x36,0xD4,0xAD,0x58,0x56,0x02,0xCF,0x27
+    };
+    wchar_t process[MAX_PATH];
+    const wchar_t *name;
+    BYTE *module = (BYTE *)GetModuleHandleW(L"windows.storage.dll"), *call;
+    DWORD length = GetModuleFileNameW(NULL, process, ARRAYSIZE(process)), old, error;
+    MEM_ADDRESS_REQUIREMENTS range = {0};
+    MEM_EXTENDED_PARAMETER parameter = {0};
+    HMODULE pinned;
+    NATIVE_COPY *slot;
+    uintptr_t next;
+    if (copy_window)
+        return ERROR_ALREADY_EXISTS;
+    if (!length || length >= ARRAYSIZE(process) ||
+        !(name = wcsrchr(process, L'\\')) || _wcsicmp(name + 1, L"explorer.exe"))
+        return ERROR_NOT_SUPPORTED;
+    if (!module || !image_matches((HMODULE)module, digest))
+        return ERROR_REVISION_MISMATCH;
+    call = module + COPY_CALL;
+    native_copy = *(NATIVE_COPY *)(module + COPY_SLOT);
+    if (memcmp(call, copy_code, sizeof(copy_code)) ||
+        native_copy != (NATIVE_COPY)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "CopyFile2"))
+        return ERROR_REVISION_MISMATCH;
+    next = (uintptr_t)(call + sizeof(copy_code));
+    range.LowestStartingAddress = (void *)((next - INT32_MAX + 0xFFFF) & ~(uintptr_t)0xFFFF);
+    range.HighestEndingAddress = (void *)(((next + INT32_MAX) & ~(uintptr_t)0xFFFF) - 1);
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &range;
+    slot = VirtualAlloc2(GetCurrentProcess(), NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                         PAGE_READWRITE, &parameter, 1);
+    if (!slot)
+        return GetLastError();
+    *slot = account_copy;
+    if (!VirtualProtect(slot, 4096, PAGE_READONLY, &old) ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (PCWSTR)account_copy, &pinned)) {
+        error = GetLastError();
+        VirtualFree(slot, 0, MEM_RELEASE);
+        return error;
+    }
+    copy_call = call;
+    copy_operand = (int32_t)((intptr_t)slot - (intptr_t)next);
+    copy_window = window;
+    copy_ui_thread = GetCurrentThreadId();
+    error = write_copy_operand(copy_operand);
+    if (error)
+        remove_copy_accounting();
+    else
+        InterlockedExchange(&copy_enabled, TRUE);
+    return error;
 }
 
 __declspec(dllexport) LONG WINAPI ShellStreamLabHits(void)
@@ -525,6 +668,15 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
             } else if (message->hwnd == search_window && message->lParam == 19) {
                 DWORD result = remove_search_timer();
                 SetPropW(message->hwnd, L"stdio.lab.search-remove", (HANDLE)((UINT_PTR)result + 1));
+            } else if (message->lParam == 20) {
+                DWORD result = install_copy_accounting(message->hwnd);
+                SetPropW(message->hwnd, L"stdio.lab.copy-install", (HANDLE)((UINT_PTR)result + 1));
+            } else if (message->hwnd == copy_window && message->lParam == 21) {
+                SetPropW(message->hwnd, L"stdio.lab.copy-accounted",
+                         (HANDLE)((UINT_PTR)ReadAcquire(&copy_accounted) + 1));
+            } else if (message->hwnd == copy_window && message->lParam == 22) {
+                DWORD result = remove_copy_accounting();
+                SetPropW(message->hwnd, L"stdio.lab.copy-remove", (HANDLE)((UINT_PTR)result + 1));
             }
         }
     }

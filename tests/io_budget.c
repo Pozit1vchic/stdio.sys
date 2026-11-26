@@ -83,7 +83,7 @@ int main(void)
 {
     IO_DEVICE a = {1, 1, TRUE}, b = {2, 2, TRUE}, c = {3, 1, TRUE};
     IO_DEVICE unknown = {0, 1, FALSE};
-    IO_PERMIT held;
+    IO_PERMIT held, native;
     BOOL success;
     if (io_budget_acquire(&held, a, b, NULL, FALSE))
         return 1;
@@ -91,6 +91,14 @@ int main(void)
               check_request(b, b, FALSE) && check_request(c, c, FALSE) &&
               check_request(unknown, c, TRUE);
     io_budget_release(&held);
+    if (success) {
+        io_budget_account_native(&native, a, a);
+        io_budget_account_native(&held, a, a);
+        success = check_request(a, a, TRUE) && check_request(c, c, FALSE);
+        io_budget_release(&native);
+        success = success && check_request(a, a, TRUE);
+        io_budget_release(&held);
+    }
     if (success)
         success = check_request(a, a, FALSE) && check_priority(a, FALSE) && check_priority(a, TRUE);
     if (!success)
