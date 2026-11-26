@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [ValidateRange(1, 4096)][int]$FileCount = 256,
-    [ValidateRange(1, 20)][int]$Rounds = 5
+    [ValidateRange(1, 20)][int]$Rounds = 5,
+    [switch]$Recycle
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop and local NTFS.
@@ -48,6 +49,8 @@ function Wait-Observed([scriptblock]$Read, [string]$Message) {
 $parent = (Resolve-Path -LiteralPath $BuildDirectory).ProviderPath
 $root = Join-Path $parent ('stdio-transfer-' + [guid]::NewGuid().ToString('N'))
 $target = Join-Path $root 'destination'
+$recycleName = 'stdio-recycle-' + [guid]::NewGuid().ToString('N')
+$recyclePath = Join-Path $target $recycleName
 $shell = New-Object -ComObject Shell.Application
 $view = $null
 $payloadSize = 65536
@@ -68,6 +71,47 @@ try {
     $explorer = Get-Process -Id $owner
     $patcher = $explorer.Modules | Where-Object ModuleName -eq ExplorerPatcher.amd64.dll
     $destination = $view.Document.Folder
+    if ($Recycle) {
+        $bin = $shell.NameSpace(10)
+        [void][IO.Directory]::CreateDirectory($recyclePath)
+        $fixture = Join-Path $recyclePath 'payload.bin'
+        [IO.File]::WriteAllBytes($fixture, $bytes)
+        Set-Content -LiteralPath $fixture -Stream stdio-test -Value 'native-recycle' -NoNewline
+        $identity = [TransferProbe]::Identity($fixture)
+        $hash = (Get-FileHash -LiteralPath $fixture).Hash
+        $item = $destination.ParseName($recycleName)
+        if (!$item) { throw 'The fixture is missing in the Explorer namespace.' }
+        $started = [DateTime]::UtcNow
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $item.InvokeVerb('delete')
+        $recycled = Wait-Observed {
+            if ([IO.Directory]::Exists($recyclePath)) { return }
+            $bin.Items() | Where-Object {
+                $_.Name -eq $recycleName -and $_.ExtendedProperty('System.Recycle.DeletedFrom') -eq $target
+            } | Select-Object -First 1
+        } 'The fixture did not appear in the Recycle Bin.'
+        $recycleMs = $timer.Elapsed.TotalMilliseconds
+        $timer.Restart()
+        $recycled.InvokeVerb('undelete')
+        $restoreMs = Wait-Observed {
+            if ([IO.File]::Exists($fixture)) { $timer.Elapsed.TotalMilliseconds }
+        } 'Explorer did not restore the fixture from the Recycle Bin.'
+        if ([TransferProbe]::Identity($fixture) -ne $identity -or
+            (Get-FileHash -LiteralPath $fixture).Hash -ne $hash -or
+            (Get-Content -LiteralPath $fixture -Stream stdio-test -Raw) -ne 'native-recycle') {
+            throw 'The restored fixture differs from the original.'
+        }
+        [pscustomobject]@{
+            Operation = 'RecycleAndRestore'
+            ExplorerPID = $owner
+            ExplorerPatcher = $(if ($patcher) { $patcher.FileVersionInfo.FileVersion })
+            StartedUtc = $started.ToString('o')
+            RecycleMs = [Math]::Round($recycleMs, 2)
+            RestoreMs = [Math]::Round($restoreMs, 2)
+            IdentityPreserved = $true
+        }
+        return
+    }
     $operations = 'Copy', 'Move'
     for ($round = 1; $round -le $Rounds; $round++) {
         foreach ($operation in $operations) {
