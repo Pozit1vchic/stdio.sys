@@ -7,6 +7,7 @@ param(
     [switch]$Junction,
     [switch]$DeniedDirectory,
     [switch]$CheckWalkCancellation,
+    [switch]$CheckWalkProgress,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
@@ -15,6 +16,10 @@ $ErrorActionPreference = 'Stop'
 $expectFallback = $Junction -or $DeniedDirectory
 if ($CheckWalkCancellation -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough -or $expectFallback)) {
     throw 'Cancellation requires the active full walk with a regular directory.'
+}
+if ($CheckWalkProgress -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough -or
+    $expectFallback -or $CheckWalkCancellation -or $FileCount -lt 2)) {
+    throw 'Progress requires the active full walk with at least two files.'
 }
 if (($Junction -and $DeniedDirectory) -or
     ($expectFallback -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough))) {
@@ -219,6 +224,7 @@ try {
         $command = if ($LabFullWalk) { 5 } else { 1 }
         if ($LabPassThrough) { $command++ }
         if ($CheckWalkCancellation) { $command = 8 }
+        if ($CheckWalkProgress) { $command = 12 }
         $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, $command, 'stdio.lab.install')
         if ($result) { throw "The Explorer experiment refused to install, Win32 error $result." }
     }
@@ -263,6 +269,22 @@ try {
         return
     }
 
+    $partialBytes = $null
+    if ($CheckWalkProgress) {
+        [void](Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 9, 'stdio.lab.paused') -eq 1
+        } 'The walk did not pause after publishing progress.')
+        $partialBytes = Wait-For {
+            foreach ($element in $dialog.FindAll('Descendants', $any)) {
+                $current = $element.Current
+                if ($current.AutomationId -eq '13064' -and $current.Name -match '[0-9]') {
+                    $bytes = Read-ByteCount $current.Name
+                    if ($bytes -gt 0 -and $bytes -lt $expectedBytes) { return $bytes }
+                }
+            }
+        } 'The native window did not display a partial result.' 10
+        [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 10, 'stdio.lab.resumed')
+    }
     $fields = Wait-For {
         $values = @{}
         foreach ($element in $dialog.FindAll('Descendants', $any)) {
@@ -370,6 +392,7 @@ try {
         ComparedCodeBytes = $(if ($dll) { 32 } else { 44 })
         OptimizedRequests = $hits
         WalkFallbacks = $fallbacks
+        PartialBytes = $partialBytes
         VerifiedDisable = [bool]$dll
         FileCount = $FileCount
         FinalFieldsMilliseconds = [Math]::Round($elapsed, 2)
@@ -381,7 +404,7 @@ try {
     if ($dll -and $view) {
         try {
             [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
-            if ($CheckWalkCancellation) {
+            if ($CheckWalkCancellation -or $CheckWalkProgress) {
                 [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 10, 'stdio.lab.resumed')
             }
         }

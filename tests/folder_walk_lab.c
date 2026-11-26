@@ -1,11 +1,14 @@
 #include "engine.h"
 #include "folder_streams.h"
+#include "folder_walk_lab.h"
 
 typedef struct {
     DWORD cluster;
-    ULONGLONG allocated;
+    FOLDER_WALK_TOTALS totals;
     const volatile LONG *running;
     void (*first_entry)(void);
+    FOLDER_WALK_PROGRESS progress;
+    void *progress_context;
 } WALK_PROPERTIES;
 
 static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
@@ -25,8 +28,11 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     /* The Shell's reparse and provider rules are independent of the engine walk. */
     if (entry->FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE))
         return ERROR_NOT_SUPPORTED;
-    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        return ERROR_SUCCESS;
+    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        ++properties->totals.folders;
+        return properties->progress ? properties->progress(properties->progress_context, &properties->totals) :
+               ERROR_SUCCESS;
+    }
     error = tree_open_snapshot_entry(directory, entry, &file, &size);
     if (error)
         return error;
@@ -37,18 +43,23 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     CloseHandle(file);
     if (error)
         return error;
-    if (allocation > MAXULONGLONG - properties->allocated)
+    if (allocation > MAXULONGLONG - properties->totals.allocated ||
+        size > MAXULONGLONG - properties->totals.bytes)
         return ERROR_ARITHMETIC_OVERFLOW;
-    properties->allocated += allocation;
-    return ERROR_SUCCESS;
+    properties->totals.allocated += allocation;
+    properties->totals.bytes += size;
+    ++properties->totals.files;
+    return properties->progress ? properties->progress(properties->progress_context, &properties->totals) :
+           ERROR_SUCCESS;
 }
 
-DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*first_entry)(void), ULONGLONG *files,
-                             ULONGLONG *folders, ULONGLONG *bytes, ULONGLONG *allocated)
+DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*first_entry)(void),
+                             FOLDER_WALK_PROGRESS progress, void *context, FOLDER_WALK_TOTALS *result)
 {
     wchar_t volume[MAX_PATH];
     DWORD sectors, sector_bytes, free_clusters, clusters;
-    WALK_PROPERTIES properties = { .running = running, .first_entry = first_entry };
+    WALK_PROPERTIES properties = { .running = running, .first_entry = first_entry,
+                                   .progress = progress, .progress_context = context };
     ULONGLONG id;
     TREE_RESULT totals;
     DWORD error;
@@ -63,10 +74,11 @@ DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*f
         return error;
     if (running && !ReadAcquire(running))
         return ERROR_CANCELLED;
-    *files = totals.files;
-    *folders = totals.directories - 1;
-    *bytes = totals.bytes;
-    *allocated = properties.allocated;
+    if (totals.files != properties.totals.files ||
+        totals.directories != properties.totals.folders + 1 ||
+        totals.bytes != properties.totals.bytes)
+        return ERROR_INVALID_DATA;
+    *result = properties.totals;
     return ERROR_SUCCESS;
 }
 
@@ -75,5 +87,13 @@ __declspec(dllexport) DWORD WINAPI ShellFolderWalkCompare(PCWSTR path, ULONGLONG
                                                           ULONGLONG *folders, ULONGLONG *bytes,
                                                           ULONGLONG *allocated)
 {
-    return folder_walk_properties(path, NULL, NULL, files, folders, bytes, allocated);
+    FOLDER_WALK_TOTALS totals;
+    DWORD error = folder_walk_properties(path, NULL, NULL, NULL, NULL, &totals);
+    if (!error) {
+        *files = totals.files;
+        *folders = totals.folders;
+        *bytes = totals.bytes;
+        *allocated = totals.allocated;
+    }
+    return error;
 }

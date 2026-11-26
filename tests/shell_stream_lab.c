@@ -1,4 +1,5 @@
 #include "folder_streams.h"
+#include "folder_walk_lab.h"
 #include <bcrypt.h>
 #include <stdint.h>
 #include <string.h>
@@ -24,9 +25,7 @@ static volatile LONG passthrough;
 static HANDLE resume_first;
 static HANDLE size_worker;
 static BOOL explorer_host;
-
-DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*first_entry)(void), ULONGLONG *files,
-                             ULONGLONG *folders, ULONGLONG *bytes, ULONGLONG *allocated);
+static BOOL pause_after_progress;
 
 static void pause_walk_entry(void)
 {
@@ -36,31 +35,71 @@ static void pause_walk_entry(void)
     }
 }
 
+typedef struct {
+    BYTE *state;
+    FOLDER_WALK_TOTALS baseline;
+    ULONGLONG next_update;
+} WALK_PROGRESS;
+
+static DWORD publish_walk(WALK_PROGRESS *progress, const FOLDER_WALK_TOTALS *totals)
+{
+    BYTE *state = progress->state;
+    const FOLDER_WALK_TOTALS *base = &progress->baseline;
+    if (!ReadAcquire((volatile LONG *)(state + 0x08)))
+        return ERROR_CANCELLED;
+    if (totals->files > MAXDWORD - base->files || totals->folders > MAXDWORD - base->folders ||
+        totals->bytes > MAXULONGLONG - base->bytes || totals->allocated > MAXULONGLONG - base->allocated)
+        return ERROR_ARITHMETIC_OVERFLOW;
+    *(ULONGLONG *)(state + 0x10) = base->bytes + totals->bytes;
+    *(ULONGLONG *)(state + 0x18) = base->allocated + totals->allocated;
+    *(DWORD *)(state + 0x20) = (DWORD)(base->files + totals->files);
+    *(DWORD *)(state + 0x24) = (DWORD)(base->folders + totals->folders);
+    return ERROR_SUCCESS;
+}
+
+static DWORD report_walk(void *context, const FOLDER_WALK_TOTALS *totals)
+{
+    WALK_PROGRESS *progress = context;
+    ULONGLONG now = GetTickCount64();
+    DWORD error;
+    if (now < progress->next_update)
+        return ERROR_SUCCESS;
+    progress->next_update = now + 100;
+    error = publish_walk(progress, totals);
+    if (!error && pause_after_progress && totals->files)
+        pause_walk_entry();
+    return error;
+}
+
 static HRESULT walk_folder(void *shell_context, PCWSTR path)
 {
     BYTE *state = shell_context;
     volatile LONG *running = (volatile LONG *)(state + 0x08);
-    ULONGLONG files, folders, bytes, allocated;
+    FOLDER_WALK_TOTALS totals, zero = {0};
+    WALK_PROGRESS progress = {
+        .state = state,
+        .baseline = { *(DWORD *)(state + 0x20), *(DWORD *)(state + 0x24),
+                      *(ULONGLONG *)(state + 0x10), *(ULONGLONG *)(state + 0x18) }
+    };
     DWORD error;
     if (ReadAcquire(&passthrough) || !wcsstr(path, L"\\stdio-properties-"))
         return original_walk(shell_context, path);
-    error = folder_walk_properties(path, running, resume_first ? pause_walk_entry : NULL,
-                                   &files, &folders, &bytes, &allocated);
+    error = folder_walk_properties(path, running, resume_first && !pause_after_progress ? pause_walk_entry : NULL,
+                                   report_walk, &progress, &totals);
+    if (!error)
+        error = publish_walk(&progress, &totals);
     if (error == ERROR_CANCELLED || !ReadAcquire(running)) {
         InterlockedIncrement(&walk_cancelled);
         return E_ABORT;
     }
-    if (error || files > MAXDWORD - *(DWORD *)(state + 0x20) ||
-        folders > MAXDWORD - *(DWORD *)(state + 0x24) ||
-        bytes > MAXULONGLONG - *(ULONGLONG *)(state + 0x10) ||
-        allocated > MAXULONGLONG - *(ULONGLONG *)(state + 0x18)) {
+    if (error) {
+        if (publish_walk(&progress, &zero) == ERROR_CANCELLED) {
+            InterlockedIncrement(&walk_cancelled);
+            return E_ABORT;
+        }
         InterlockedIncrement(&walk_fallbacks);
         return original_walk(shell_context, path);
     }
-    *(ULONGLONG *)(state + 0x10) += bytes;
-    *(ULONGLONG *)(state + 0x18) += allocated;
-    *(DWORD *)(state + 0x20) += (DWORD)files;
-    *(DWORD *)(state + 0x24) += (DWORD)folders;
     InterlockedIncrement(&hits);
     return S_OK;
 }
@@ -283,9 +322,11 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
         if (message->message == RegisterWindowMessageW(L"stdio.shell.stream.lab.2026") &&
             message->wParam == GetCurrentProcessId() && message->hwnd != GetShellWindow()) {
             if (message->lParam == 1 || message->lParam == 2 ||
-                message->lParam == 5 || message->lParam == 6 || message->lParam == 8) {
+                message->lParam == 5 || message->lParam == 6 ||
+                message->lParam == 8 || message->lParam == 12) {
+                pause_after_progress = message->lParam == 12;
                 DWORD result = install(message->lParam == 2 || message->lParam == 6,
-                                       message->lParam == 8, TRUE,
+                                       message->lParam == 8 || message->lParam == 12, TRUE,
                                        message->lParam >= 5);
                 SetPropW(message->hwnd, L"stdio.lab.install", (HANDLE)((UINT_PTR)result + 1));
             } else if (message->lParam == 3) {
