@@ -240,6 +240,7 @@ try {
     $item = $view.Document.Folder.ParseName($name)
     if (!$item) { throw 'The test folder is missing from the Explorer view.' }
     $baselineCpu = $explorer.TotalProcessorTime.TotalMilliseconds
+    $invokedTick = [Diagnostics.Stopwatch]::GetTimestamp()
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $item.InvokeVerb('properties')
     $dialog = Wait-For { Find-PropertiesWindow } 'Explorer did not open the properties window.' 10
@@ -306,6 +307,7 @@ try {
             (Read-ByteCount $values['13106']) -eq $expectedBytes -and
             (Test-ContainsFiles $values['13087'] $FileCount $expectedFolders)) { $values }
     } "Explorer did not publish the expected totals for $FileCount files." 10
+    $fieldsTick = [Diagnostics.Stopwatch]::GetTimestamp()
     $elapsed = $watch.Elapsed.TotalMilliseconds
 
     $explorer.Refresh()
@@ -363,6 +365,21 @@ try {
     if ($fallbacks -ne [int]$expectFallback) {
         throw "Unexpected full-walk fallback count: $fallbacks."
     }
+    $workerStartMs = $workerMs = $workerEndToFieldsMs = $null
+    if ($dll -and $LabFullWalk) {
+        $finishedTick = Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 14, 'stdio.lab.walk-finished')
+        } 'The instrumented properties worker did not finish.'
+        $startedTick = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 13, 'stdio.lab.walk-started')
+        if ($startedTick -lt $invokedTick -or $finishedTick -lt $startedTick -or
+            $finishedTick -gt [Diagnostics.Stopwatch]::GetTimestamp()) {
+            throw 'The properties worker timestamps are out of sequence.'
+        }
+        $msPerTick = 1000.0 / [Diagnostics.Stopwatch]::Frequency
+        $workerStartMs = [Math]::Round(($startedTick - $invokedTick) * $msPerTick, 2)
+        $workerMs = [Math]::Round(($finishedTick - $startedTick) * $msPerTick, 2)
+        $workerEndToFieldsMs = [Math]::Round(($fieldsTick - $finishedTick) * $msPerTick, 2)
+    }
     if ($dll) {
         [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
         if (![ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
@@ -405,6 +422,9 @@ try {
         FileCount = $FileCount
         Depth = $Depth
         FinalFieldsMilliseconds = [Math]::Round($elapsed, 2)
+        WorkerStartMilliseconds = $workerStartMs
+        WorkerMilliseconds = $workerMs
+        WorkerEndToFieldsMilliseconds = $workerEndToFieldsMs
         ProcessCpuMilliseconds = [Math]::Round($cpu, 2)
         ProcessPeakWorkingSetBytes = $peakWorkingSet
         ProcessPrivateBytes = $privateBytes

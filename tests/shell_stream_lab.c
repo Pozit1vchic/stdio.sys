@@ -19,6 +19,8 @@ static HRESULT (*original_walk)(void *, PCWSTR);
 static volatile LONG hits;
 static volatile LONG walk_fallbacks;
 static volatile LONG walk_cancelled;
+static volatile LONG64 walk_started;
+static volatile LONG64 walk_finished;
 static volatile LONG requests;
 static volatile LONG pause_claimed;
 static volatile LONG passthrough;
@@ -72,8 +74,17 @@ static DWORD report_walk(void *context, const FOLDER_WALK_TOTALS *totals)
     return error;
 }
 
+static HRESULT finish_walk(HRESULT result)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    InterlockedExchange64(&walk_finished, now.QuadPart);
+    return result;
+}
+
 static HRESULT walk_folder(void *shell_context, PCWSTR path)
 {
+    LARGE_INTEGER now;
     BYTE *state = shell_context;
     volatile LONG *running = (volatile LONG *)(state + 0x08);
     FOLDER_WALK_TOTALS totals, zero = {0};
@@ -83,26 +94,31 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
                       *(ULONGLONG *)(state + 0x10), *(ULONGLONG *)(state + 0x18) }
     };
     DWORD error;
-    if (ReadAcquire(&passthrough) || !wcsstr(path, L"\\stdio-properties-"))
+    if (!wcsstr(path, L"\\stdio-properties-"))
         return original_walk(shell_context, path);
+    QueryPerformanceCounter(&now);
+    InterlockedExchange64(&walk_finished, 0);
+    InterlockedExchange64(&walk_started, now.QuadPart);
+    if (ReadAcquire(&passthrough))
+        return finish_walk(original_walk(shell_context, path));
     error = folder_walk_properties(path, running, resume_first && !pause_after_progress ? pause_walk_entry : NULL,
                                    report_walk, &progress, &totals);
     if (!error)
         error = publish_walk(&progress, &totals);
     if (error == ERROR_CANCELLED || !ReadAcquire(running)) {
         InterlockedIncrement(&walk_cancelled);
-        return E_ABORT;
+        return finish_walk(E_ABORT);
     }
     if (error) {
         if (publish_walk(&progress, &zero) == ERROR_CANCELLED) {
             InterlockedIncrement(&walk_cancelled);
-            return E_ABORT;
+            return finish_walk(E_ABORT);
         }
         InterlockedIncrement(&walk_fallbacks);
-        return original_walk(shell_context, path);
+        return finish_walk(original_walk(shell_context, path));
     }
     InterlockedIncrement(&hits);
-    return S_OK;
+    return finish_walk(S_OK);
 }
 
 static HRESULT read_streams(PCWSTR path, SHELL_STREAM_VISITOR *visitor)
@@ -346,6 +362,10 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
                 SetPropW(message->hwnd, L"stdio.lab.resumed", (HANDLE)(UINT_PTR)1);
             } else if (message->lParam == 11) {
                 SetPropW(message->hwnd, L"stdio.lab.cancelled", (HANDLE)((UINT_PTR)ReadAcquire(&walk_cancelled) + 1));
+            } else if (message->lParam == 13) {
+                SetPropW(message->hwnd, L"stdio.lab.walk-started", (HANDLE)((UINT_PTR)ReadAcquire64(&walk_started) + 1));
+            } else if (message->lParam == 14) {
+                SetPropW(message->hwnd, L"stdio.lab.walk-finished", (HANDLE)((UINT_PTR)ReadAcquire64(&walk_finished) + 1));
             }
         }
     }
