@@ -13,6 +13,7 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($Recycle -and $ClipboardVerbs) { throw 'Choose recycle or clipboard transfer.' }
 if ($Recycle -and $Operation -ne 'Both') { throw 'The operation filter applies to transfers only.' }
+if ($Recycle -and !$PSBoundParameters.ContainsKey('FileCount')) { $FileCount = 1 }
 if ($CheckCollision -and ($Recycle -or $ClipboardVerbs -or $Operation -ne 'Both')) {
     throw 'The collision control uses clipboard copy and paste.'
 }
@@ -76,16 +77,35 @@ public static class TransferProbe
     private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int infoClass,
         [Out] byte[] info, uint size);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(string path, uint access, uint sharing,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    public static string DirectoryIdentity(string path)
+    {
+        const uint ReadAttributes = 0x80, ShareAll = 7, OpenExisting = 3, BackupSemantics = 0x02000000;
+        using (var handle = CreateFile(path, ReadAttributes, ShareAll, IntPtr.Zero,
+            OpenExisting, BackupSemantics, IntPtr.Zero))
+        {
+            if (handle.IsInvalid)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return Identity(handle);
+        }
+    }
+
     public static string Identity(string path)
     {
         using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete))
-        {
-            var identity = new byte[24]; // FILE_ID_INFO: volume serial followed by FILE_ID_128.
-            if (!GetFileInformationByHandleEx(stream.SafeFileHandle, 18, identity, 24))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-            return BitConverter.ToString(identity);
-        }
+            return Identity(stream.SafeFileHandle);
+    }
+
+    private static string Identity(SafeFileHandle handle)
+    {
+        var identity = new byte[24]; // FILE_ID_INFO: volume serial followed by FILE_ID_128.
+        if (!GetFileInformationByHandleEx(handle, 18, identity, 24))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return BitConverter.ToString(identity);
     }
 }
 "@
@@ -249,11 +269,23 @@ try {
     }
     if ($Recycle) {
         $bin = $shell.NameSpace(10)
-        [void][IO.Directory]::CreateDirectory($recyclePath)
-        $fixture = Join-Path $recyclePath 'payload.bin'
-        [IO.File]::WriteAllBytes($fixture, $bytes)
+        $fileDirectory = if ($FileCount -eq 1) { $recyclePath } else { Join-Path $recyclePath 'nested' }
+        [void][IO.Directory]::CreateDirectory($fileDirectory)
+        $identities = @{}
+        for ($i = 0; $i -lt $FileCount; $i++) {
+            $path = Join-Path $fileDirectory ('fixture-{0:d4}.bin' -f $i)
+            [IO.File]::WriteAllBytes($path, $bytes)
+            $identities[$path] = [TransferProbe]::Identity($path)
+        }
+        $fixture = Join-Path $fileDirectory 'fixture-0000.bin'
         Set-Content -LiteralPath $fixture -Stream stdio-test -Value 'native-recycle' -NoNewline
-        $identity = [TransferProbe]::Identity($fixture)
+        $directoryId = [TransferProbe]::DirectoryIdentity($recyclePath)
+        $nestedId = [TransferProbe]::DirectoryIdentity($fileDirectory)
+        if ($FileCount -gt 1) {
+            $link = Join-Path $fileDirectory 'hardlink.bin'
+            New-Item -ItemType HardLink -Path $link -Target $fixture | Out-Null
+            $identities[$link] = $identities[$fixture]
+        }
         $hash = (Get-FileHash -LiteralPath $fixture).Hash
         $item = $destination.ParseName($recycleName)
         if (!$item) { throw 'The fixture is missing in the Explorer namespace.' }
@@ -272,10 +304,17 @@ try {
         $restoreMs = Wait-Observed {
             if ([IO.File]::Exists($fixture)) { $timer.Elapsed.TotalMilliseconds }
         } 'Explorer did not restore the fixture from the Recycle Bin.'
-        if ([TransferProbe]::Identity($fixture) -ne $identity -or
-            (Get-FileHash -LiteralPath $fixture).Hash -ne $hash -or
+        if ([TransferProbe]::DirectoryIdentity($recyclePath) -ne $directoryId -or
+            [TransferProbe]::DirectoryIdentity($fileDirectory) -ne $nestedId -or
+            [IO.Directory]::GetFiles($fileDirectory).Length -ne $identities.Count -or
             (Get-Content -LiteralPath $fixture -Stream stdio-test -Raw) -ne 'native-recycle') {
-            throw 'The restored fixture differs from the original.'
+            throw 'The restored tree differs from the original.'
+        }
+        foreach ($path in $identities.Keys) {
+            if ([TransferProbe]::Identity($path) -ne $identities[$path] -or
+                (Get-FileHash -LiteralPath $path).Hash -ne $hash) {
+                throw "The restored file differs from the original: $path"
+            }
         }
         [pscustomobject]@{
             Operation = 'RecycleAndRestore'
@@ -285,6 +324,7 @@ try {
             RecycleMs = [Math]::Round($recycleMs, 2)
             RestoreMs = [Math]::Round($restoreMs, 2)
             IdentityPreserved = $true
+            Files = $identities.Count
         }
         return
     }
