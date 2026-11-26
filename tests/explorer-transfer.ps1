@@ -3,12 +3,14 @@ param(
     [ValidateRange(1, 4096)][int]$FileCount = 256,
     [ValidateRange(1, 20)][int]$Rounds = 5,
     [switch]$Recycle,
-    [switch]$ClipboardVerbs
+    [switch]$ClipboardVerbs,
+    [ValidateSet('Both', 'Copy', 'Move')][string]$Operation = 'Both'
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop and local NTFS.
 $ErrorActionPreference = 'Stop'
 if ($Recycle -and $ClipboardVerbs) { throw 'Choose recycle or clipboard transfer.' }
+if ($Recycle -and $Operation -ne 'Both') { throw 'The operation filter applies to transfers only.' }
 if ($ClipboardVerbs) { Add-Type -AssemblyName System.Windows.Forms }
 Add-Type @"
 using System;
@@ -155,12 +157,13 @@ try {
         }
         return
     }
-    $operations = 'Copy', 'Move'
+    $operations = if ($Operation -eq 'Both') { @('Copy', 'Move') } else { @($Operation) }
+    $operations = @($operations)
     if ($ClipboardVerbs) { $clipboard = [TransferProbe+ClipboardBackup]::new() }
     for ($round = 1; $round -le $Rounds; $round++) {
-        foreach ($operation in $operations) {
-            $source = Join-Path $root "$operation-$round"
-            $output = Join-Path $target "$operation-$round"
+        foreach ($transfer in $operations) {
+            $source = Join-Path $root "$transfer-$round"
+            $output = Join-Path $target "$transfer-$round"
             [void][IO.Directory]::CreateDirectory($source)
             $paths = for ($i = 0; $i -lt $FileCount; $i++) {
                 $name = '{0:d4}.bin' -f $i
@@ -179,7 +182,7 @@ try {
                 $sourceFolder = $view.Document.Folder.ParentFolder
                 $item = $sourceFolder.ParseName([IO.Path]::GetFileName($source))
                 if (!$item) { throw 'The source fixture did not resolve in Explorer.' }
-                $verb = if ($operation -eq 'Copy') { 'copy' } else { 'cut' }
+                $verb = if ($transfer -eq 'Copy') { 'copy' } else { 'cut' }
                 $priorSequence = [TransferProbe]::GetClipboardSequenceNumber()
                 $item.InvokeVerb($verb)
                 $clipboardSequence = Wait-Observed {
@@ -201,17 +204,18 @@ try {
                 }
                 $destination.Self.InvokeVerb('paste')
             }
-            elseif ($operation -eq 'Copy') { $destination.CopyHere($source) }
+            elseif ($transfer -eq 'Copy') { $destination.CopyHere($source) }
             else { $destination.MoveHere($source) }
 
             $elapsed = Wait-Observed {
-                if ($operation -eq 'Move' -and [IO.Directory]::Exists($source)) { return }
+                if ($transfer -eq 'Move' -and [IO.Directory]::Exists($source)) { return }
                 foreach ($path in $paths) {
                     $file = [IO.FileInfo]::new($path)
                     if (!$file.Exists -or $file.Length -ne $payloadSize) { return }
                 }
                 $watch.Elapsed.TotalMilliseconds
-            } "Explorer did not produce the expected $operation tree."
+            } "Explorer did not produce the expected $transfer tree."
+            $observed = $started.AddMilliseconds($elapsed)
             $explorer.Refresh()
             $cpuMs = $explorer.TotalProcessorTime.TotalMilliseconds - $cpu
             foreach ($path in $paths) {
@@ -220,16 +224,16 @@ try {
                 }
             }
             $targetId = [TransferProbe]::Identity($paths[0])
-            if (($targetId -eq $sourceId) -ne ($operation -eq 'Move')) {
-                throw "Unexpected file identity after $operation."
+            if (($targetId -eq $sourceId) -ne ($transfer -eq 'Move')) {
+                throw "Unexpected file identity after $transfer."
             }
             if ((Get-Content -LiteralPath $paths[0] -Stream stdio-test -Raw) -ne 'native-transfer') {
-                throw "Alternate data stream did not survive $operation."
+                throw "Alternate data stream did not survive $transfer."
             }
-            if ($operation -eq 'Copy' -and [IO.Directory]::GetFiles($source).Count -ne $FileCount) {
+            if ($transfer -eq 'Copy' -and [IO.Directory]::GetFiles($source).Count -ne $FileCount) {
                 throw 'Copy changed the source tree.'
             }
-            if ($clipboard -and $operation -eq 'Move' -and
+            if ($clipboard -and $transfer -eq 'Move' -and
                 [TransferProbe]::GetClipboardSequenceNumber() -ne $clipboardSequence) {
                 $afterPaste = [TransferProbe]::GetClipboardSequenceNumber()
                 if ([Windows.Forms.Clipboard]::GetDataObject().GetFormats().Count -ne 0 -or
@@ -239,11 +243,14 @@ try {
                 $clipboardSequence = $afterPaste
             }
             [pscustomobject]@{
-                Operation = $operation
+                Operation = $transfer
                 EntryPoint = $(if ($clipboard) { 'ClipboardVerbs' } else { 'FolderAutomation' })
                 Round = $round
                 ExplorerPID = $owner
                 StartedUtc = $started.ToString('o')
+                ObservedUtc = $observed.ToString('o')
+                SourcePath = $source
+                DestinationPath = $output
                 ExplorerPatcher = $(if ($patcher) { $patcher.FileVersionInfo.FileVersion })
                 Files = $FileCount
                 FirstFileIdentityPreserved = $targetId -eq $sourceId
