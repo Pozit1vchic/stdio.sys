@@ -18,7 +18,7 @@ DWORD io_budget_acquire(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destinati
                         HANDLE cancel, BOOL background);
 /* The running flag is owned by the caller and remains valid while waiting. */
 DWORD io_budget_acquire_background(IO_PERMIT *permit, IO_DEVICE device, const volatile LONG *running,
-                                   BOOL *yielded_to_native);
+                                   BOOL prefer_native, BOOL *yielded_to_native);
 /* Observe work already admitted by the caller. Native callbacks must stay
    free to run even when the device is full. Release as for a regular permit. */
 void io_budget_account_native(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destination);

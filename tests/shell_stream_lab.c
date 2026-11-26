@@ -22,7 +22,8 @@ static HRESULT (*original_walk)(void *, PCWSTR);
 static volatile LONG hits;
 static volatile LONG walk_fallbacks;
 static volatile LONG walk_cancelled;
-static volatile LONG walk_yields, budgeted_walk;
+enum { WALK_BUDGET_OFF, WALK_BUDGET_STRICT, WALK_BUDGET_ADAPTIVE };
+static volatile LONG walk_yields, budgeted_walk, walk_device_limit;
 static DWORD budget_control_thread;
 static volatile LONG64 walk_started;
 static volatile LONG64 walk_finished;
@@ -100,6 +101,7 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
                       *(ULONGLONG *)(state + 0x10), *(ULONGLONG *)(state + 0x18) }
     };
     DWORD error;
+    LONG budget_mode;
     if (!wcsstr(path, L"\\stdio-properties-"))
         return original_walk(shell_context, path);
     QueryPerformanceCounter(&now);
@@ -107,8 +109,12 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
     InterlockedExchange64(&walk_started, now.QuadPart);
     if (ReadAcquire(&passthrough))
         return finish_walk(original_walk(shell_context, path));
-    if (ReadAcquire(&budgeted_walk) && GetCurrentThreadId() != budget_control_thread)
+    budget_mode = ReadAcquire(&budgeted_walk);
+    if (budget_mode != WALK_BUDGET_OFF && GetCurrentThreadId() != budget_control_thread) {
         budget.device = io_device_for_path(path, storage_workers(path));
+        budget.prefer_native = budget_mode == WALK_BUDGET_STRICT || budget.device.limit == 1;
+    }
+    InterlockedExchange(&walk_device_limit, budget.device.known ? (LONG)budget.device.limit : 0);
     error = folder_walk_properties(path, running, resume_first && !pause_after_progress ? pause_walk_entry : NULL,
                                    report_walk, &progress, budget.device.known ? &budget : NULL, &totals);
     InterlockedExchange(&walk_yields, (LONG)budget.yielded);
@@ -689,9 +695,9 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
             } else if (message->hwnd == copy_window && message->lParam == 22) {
                 DWORD result = remove_copy_accounting();
                 SetPropW(message->hwnd, L"stdio.lab.copy-remove", (HANDLE)((UINT_PTR)result + 1));
-            } else if (message->hwnd == copy_window && message->lParam == 23) {
+            } else if (message->hwnd == copy_window && (message->lParam == 23 || message->lParam == 27)) {
                 budget_control_thread = GetCurrentThreadId();
-                InterlockedExchange(&budgeted_walk, TRUE);
+                InterlockedExchange(&budgeted_walk, message->lParam == 23 ? WALK_BUDGET_STRICT : WALK_BUDGET_ADAPTIVE);
                 SetPropW(message->hwnd, L"stdio.lab.walk-budget", (HANDLE)(UINT_PTR)1);
             } else if (message->hwnd == copy_window && message->lParam == 24) {
                 SetPropW(message->hwnd, L"stdio.lab.walk-yields",
@@ -702,6 +708,9 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
             } else if (message->hwnd == copy_window && message->lParam == 26) {
                 SetPropW(message->hwnd, L"stdio.lab.copy-finished",
                          (HANDLE)((UINT_PTR)ReadAcquire64(&copy_finished) + 1));
+            } else if (message->hwnd == copy_window && message->lParam == 28) {
+                SetPropW(message->hwnd, L"stdio.lab.walk-device-limit",
+                         (HANDLE)((UINT_PTR)ReadAcquire(&walk_device_limit) + 1));
             }
         }
     }

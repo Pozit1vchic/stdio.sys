@@ -41,7 +41,7 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     if (properties->budget && !properties->remaining) {
         BOOL yielded;
         error = io_budget_acquire_background(&properties->permit, properties->budget->device,
-                                             properties->running, &yielded);
+                                             properties->running, properties->budget->prefer_native, &yielded);
         if (yielded)
             ++properties->budget->yielded;
         if (error)

@@ -10,6 +10,7 @@ typedef struct {
     LONG position;
     const volatile LONG *running;
     BOOL yielded;
+    BOOL prefer_native;
 } REQUEST;
 
 static DWORD WINAPI acquire(void *context)
@@ -18,7 +19,7 @@ static DWORD WINAPI acquire(void *context)
     IO_PERMIT permit;
     if (request->running)
         request->result = io_budget_acquire_background(&permit, request->source, request->running,
-                                                       &request->yielded);
+                                                       request->prefer_native, &request->yielded);
     else
         request->result = io_budget_acquire(&permit, request->source, request->destination,
                                             request->cancel, request->background);
@@ -30,11 +31,11 @@ static DWORD WINAPI acquire(void *context)
     return 0;
 }
 
-static BOOL check_native_priority(IO_DEVICE device, BOOL age)
+static BOOL check_native_priority(IO_DEVICE device, BOOL prefer_native, BOOL age)
 {
     IO_PERMIT native;
     volatile LONG running = TRUE;
-    REQUEST request = { .source = device, .running = &running };
+    REQUEST request = { .source = device, .running = &running, .prefer_native = prefer_native };
     HANDLE thread;
     DWORD observed;
     io_budget_account_native(&native, device, device);
@@ -43,11 +44,13 @@ static BOOL check_native_priority(IO_DEVICE device, BOOL age)
         io_budget_release(&native);
         return FALSE;
     }
-    observed = WaitForSingleObject(thread, age ? 2000 : 100);
+    observed = WaitForSingleObject(thread, age || !prefer_native ? 2000 : 100);
     InterlockedExchange(&running, FALSE);
     WaitForSingleObject(thread, INFINITE);
     io_budget_release(&native);
     CloseHandle(thread);
+    if (!prefer_native)
+        return observed == WAIT_OBJECT_0 && request.result == ERROR_SUCCESS && !request.yielded;
     return request.yielded && (age ? observed == WAIT_OBJECT_0 && request.result == ERROR_SUCCESS :
                                observed == WAIT_TIMEOUT && request.result == ERROR_CANCELLED);
 }
@@ -129,7 +132,8 @@ int main(void)
     }
     if (success)
         success = check_request(a, a, FALSE) && check_priority(a, FALSE) && check_priority(a, TRUE) &&
-                  check_native_priority(b, FALSE) && check_native_priority(b, TRUE);
+                  check_native_priority(b, TRUE, FALSE) && check_native_priority(b, TRUE, TRUE) &&
+                  check_native_priority(b, FALSE, FALSE);
     if (!success)
         fputs("Disk limit, cross-device permit or cancellation failed.\n", stderr);
     return success ? 0 : 1;

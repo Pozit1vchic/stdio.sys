@@ -12,6 +12,7 @@ typedef struct IO_WAIT {
     HANDLE cancel;
     const volatile LONG *running;
     BOOL background;
+    BOOL prefer_native;
 } IO_WAIT;
 
 static IO_WAIT *waiting;
@@ -96,8 +97,8 @@ static BOOL has_predecessor(const IO_WAIT *request)
              overlaps(request->source, other->destination) ||
              overlaps(request->destination, other->source) ||
              overlaps(request->destination, other->destination)) &&
-            !cancelled(other) && fits(other->source, !other_priority, NULL) &&
-            fits(other->destination, !other_priority, NULL))
+            !cancelled(other) && fits(other->source, other->prefer_native && !other_priority, NULL) &&
+            fits(other->destination, other->prefer_native && !other_priority, NULL))
             return TRUE;
     }
     return FALSE;
@@ -115,7 +116,8 @@ static DWORD acquire(IO_PERMIT *permit, IO_WAIT *request, BOOL *yielded_to_nativ
         ;
     *link = request;
     for (;;) {
-        BOOL yield_native = !promoted(request, GetTickCount64());
+        BOOL low_priority = !promoted(request, GetTickCount64());
+        BOOL yield_native = request->prefer_native && low_priority;
         if (cancelled(request)) {
             error = ERROR_CANCELLED;
             break;
@@ -127,7 +129,7 @@ static DWORD acquire(IO_PERMIT *permit, IO_WAIT *request, BOOL *yielded_to_nativ
             break;
         }
         if (!SleepConditionVariableSRW(&available, &lock,
-                                       request->cancel || request->running || yield_native ? 25 : INFINITE, 0) &&
+                                       request->cancel || request->running || low_priority ? 25 : INFINITE, 0) &&
             GetLastError() != ERROR_TIMEOUT) {
             error = GetLastError();
             break;
@@ -146,14 +148,15 @@ DWORD io_budget_acquire(IO_PERMIT *permit, IO_DEVICE source, IO_DEVICE destinati
                         HANDLE cancel, BOOL background)
 {
     IO_WAIT request = { .source = source, .destination = destination, .cancel = cancel,
-                        .background = background };
+                        .background = background, .prefer_native = background };
     return acquire(permit, &request, NULL);
 }
 
 DWORD io_budget_acquire_background(IO_PERMIT *permit, IO_DEVICE device, const volatile LONG *running,
-                                   BOOL *yielded_to_native)
+                                   BOOL prefer_native, BOOL *yielded_to_native)
 {
-    IO_WAIT request = { .source = device, .destination = device, .running = running, .background = TRUE };
+    IO_WAIT request = { .source = device, .destination = device, .running = running,
+                        .background = TRUE, .prefer_native = prefer_native };
     return acquire(permit, &request, yielded_to_native);
 }
 

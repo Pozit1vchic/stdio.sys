@@ -10,6 +10,7 @@ typedef DWORD (*FOLDER_WALK_PROGRESS)(void *context, const FOLDER_WALK_TOTALS *t
 
 typedef struct {
     IO_DEVICE device;
+    BOOL prefer_native;
     DWORD yielded;
 } FOLDER_WALK_BUDGET;
 

@@ -10,6 +10,7 @@ param(
     [switch]$CheckWalkProgress,
     [switch]$ConcurrentCopy,
     [switch]$LabWalkBudget,
+    [switch]$LabAdaptiveWalkBudget,
     [ValidateRange(0, 16)][int]$Depth = 0,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
@@ -17,7 +18,8 @@ param(
 # Run with Windows PowerShell -STA on an interactive desktop.
 $ErrorActionPreference = 'Stop'
 $expectFallback = $Junction -or $DeniedDirectory
-if (($LabWalkBudget -and !$ConcurrentCopy) -or
+if (($LabWalkBudget -and $LabAdaptiveWalkBudget) -or
+    (($LabWalkBudget -or $LabAdaptiveWalkBudget) -and !$ConcurrentCopy) -or
     ($ConcurrentCopy -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough -or $expectFallback -or
                           $CheckWalkProgress -or $CheckWalkCancellation))) {
     throw 'Concurrent copy requires the active full walk with an ordinary fixture.'
@@ -173,8 +175,9 @@ try {
             $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 20, 'stdio.lab.copy-install')
             if ($result) { throw "Copy accounting refused to install, Win32 error $result." }
             $copyReady = $true
-            if ($LabWalkBudget) {
-                [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 23, 'stdio.lab.walk-budget')
+            if ($LabWalkBudget -or $LabAdaptiveWalkBudget) {
+                $budgetCommand = if ($LabWalkBudget) { 23 } else { 27 }
+                [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, $budgetCommand, 'stdio.lab.walk-budget')
             }
         }
     }
@@ -271,7 +274,11 @@ try {
         $copyEnd = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 26, 'stdio.lab.copy-finished')
         $copyElapsed = [Math]::Round(($copyEnd - $copyStartTick) * 1000 / [Diagnostics.Stopwatch]::Frequency, 2)
         $yields = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 24, 'stdio.lab.walk-yields')
-        if ([bool]$yields -ne [bool]$LabWalkBudget) {
+        $budgetLimit = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 28, 'stdio.lab.walk-device-limit')
+        if (($LabWalkBudget -or $LabAdaptiveWalkBudget) -and !$budgetLimit) {
+            throw 'The background walk could not identify its physical disk.'
+        }
+        if ([bool]$yields -ne [bool]($LabWalkBudget -or ($LabAdaptiveWalkBudget -and $budgetLimit -eq 1))) {
             throw "Unexpected number of background yields for this mode: $yields."
         }
     }
@@ -404,7 +411,8 @@ try {
         ProcessPeakWorkingSetBytes = $peakWorkingSet
         ProcessPrivateBytes = $privateBytes
         ConcurrentCopyMilliseconds = $copyElapsed
-        BackgroundWalkBudget = [bool]$LabWalkBudget
+        BackgroundWalkBudget = [bool]($LabWalkBudget -or $LabAdaptiveWalkBudget)
+        WalkDeviceLimit = $budgetLimit
         WalkNativeYields = $yields
     }
 } finally {
