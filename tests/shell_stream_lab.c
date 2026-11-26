@@ -230,14 +230,14 @@ static HWND search_window;
 static BYTE *search_shell;
 static int32_t search_notify_operand, search_timer_operand;
 static DWORD search_thread;
-static volatile LONG search_timer_enabled, search_timer_hits;
+static volatile LONG search_timer_delay, search_timer_hits;
 static _Thread_local BOOL exact_search;
 
 static HRESULT search_notify(void *view, PCWSTR text, PCWSTR stripped, DWORD flags)
 {
     BOOL previous = exact_search;
     HRESULT result;
-    exact_search = ReadAcquire(&search_timer_enabled) && GetCurrentThreadId() == search_thread &&
+    exact_search = ReadAcquire(&search_timer_delay) && GetCurrentThreadId() == search_thread &&
                    flags == 1 && exact_name_query(text, NULL, NULL) && stripped && !wcscmp(text, stripped);
     result = stock_search_notify(view, text, stripped, flags);
     exact_search = previous;
@@ -246,10 +246,11 @@ static HRESULT search_notify(void *view, PCWSTR text, PCWSTR stripped, DWORD fla
 
 static UINT_PTR WINAPI search_timer(HWND window, UINT_PTR id, UINT delay, TIMERPROC callback)
 {
-    BOOL adjust = exact_search && id == 5 && delay == 500 && !callback &&
-                  GetAncestor(window, GA_ROOT) == search_window;
-    UINT_PTR timer = stock_search_timer(window, id, adjust ? 100 : delay, callback);
-    if (adjust && timer)
+    UINT accelerated = 0;
+    if (exact_search && id == 5 && delay == 500 && !callback && GetAncestor(window, GA_ROOT) == search_window)
+        accelerated = (UINT)ReadAcquire(&search_timer_delay);
+    UINT_PTR timer = stock_search_timer(window, id, accelerated ? accelerated : delay, callback);
+    if (accelerated && timer)
         InterlockedIncrement(&search_timer_hits);
     return timer;
 }
@@ -347,7 +348,7 @@ static DWORD remove_search_timer(void)
 {
     BYTE *notify = search_shell + SEARCH_NOTIFY_CALL, *timer = search_shell + SEARCH_TIMER_CALL;
     int32_t current_notify, current_timer, original_notify, original_timer;
-    InterlockedExchange(&search_timer_enabled, FALSE);
+    InterlockedExchange(&search_timer_delay, 0);
     if (!memcmp(notify, search_notify_code, sizeof(search_notify_code)) &&
         !memcmp(timer, search_timer_code, sizeof(search_timer_code)))
         return ERROR_SUCCESS;
@@ -677,8 +678,9 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
                 DWORD result = install_search_timer(message->hwnd);
                 SetPropW(message->hwnd, L"stdio.lab.search-install", (HANDLE)((UINT_PTR)result + 1));
             } else if (message->hwnd == search_window &&
-                       (message->lParam == 16 || message->lParam == 17)) {
-                InterlockedExchange(&search_timer_enabled, message->lParam == 16);
+                       (message->lParam == 16 || message->lParam == 17 || message->lParam == 29)) {
+                InterlockedExchange(&search_timer_delay, message->lParam == 16 ? 100 :
+                                                         message->lParam == 29 ? 10 : 0);
                 SetPropW(message->hwnd, L"stdio.lab.search-mode", (HANDLE)(UINT_PTR)1);
             } else if (message->hwnd == search_window && message->lParam == 18) {
                 SetPropW(message->hwnd, L"stdio.lab.search-hits",

@@ -6,13 +6,19 @@ param(
     [switch]$SearchRename,
     [ValidateSet('FileSystem', 'Shell')][string]$RenameMethod = 'FileSystem',
     [string]$LabSearchDll,
-    [switch]$CheckSearchFallback
+    [switch]$CheckSearchFallback,
+    [switch]$CompareShortTimer,
+    [switch]$CheckSearchReplacement
 )
 
 # Run with Windows PowerShell -STA from an interactive desktop.
 $ErrorActionPreference = 'Stop'
 if ($SearchRename) { $Search = $true }
 if ($CheckSearchFallback -and !$LabSearchDll) { throw 'Fallback requires the search lab.' }
+if (($CompareShortTimer -or $CheckSearchReplacement) -and (!$LabSearchDll -or $CheckSearchFallback)) {
+    throw 'Short timer measurements require the active exact search lab.'
+}
+if ($CheckSearchReplacement -and !$CompareShortTimer) { throw 'Replacement compares both timer lengths.' }
 if ($LabSearchDll) {
     if ($SearchRename) { throw 'Use a separate run for rename and the search timer.' }
     if (!$CheckSearchFallback -and $Rounds % 2) { throw 'Use an even number of paired search rounds.' }
@@ -205,13 +211,27 @@ try {
             $expectedItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) $locationNeedle
             $searchText = 'System.FileName:="{0}"' -f $locationNeedle
             $active = [bool](($pair % 4 -in 1,2) -xor ($round % 2 -eq 0))
-            $command = if ($active) { 16 } else { 17 }
+            $command = if ($CompareShortTimer) {
+                if ($active) { 29 } else { 16 }
+            } elseif ($active) { 16 } else { 17 }
             [void][ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, $command, 'stdio.lab.search-mode')
             $hitsBefore = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits')
         }
         $explorer.Refresh()
         $cpuStart = $explorer.TotalProcessorTime.TotalMilliseconds
         $ioStart = [ExplorerViewOwner]::ReadIo($explorer.Handle)
+        $editGap = $null
+        if ($CheckSearchReplacement) {
+            $earlierName = if ($locationNeedle -eq $originalName) { $unicodeName } else { $originalName }
+            $earlierItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) $earlierName
+            $typing = [Diagnostics.Stopwatch]::StartNew()
+            $searchValue.SetValue(('System.FileName:="{0}"' -f $earlierName))
+            Start-Sleep -Milliseconds 25
+            $searchValue = (Wait-TestValue {
+                [Windows.Automation.AutomationElement]::FromHandle($window).FindFirst($scope, $searchEdit)
+            }).GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
+            $editGap = [Math]::Round($typing.Elapsed.TotalMilliseconds, 2)
+        }
         $navigationStart = [DateTime]::UtcNow
         $clock = [Diagnostics.Stopwatch]::StartNew()
         if ($Search) { $searchValue.SetValue($searchText) } else { $view.Navigate2($target) }
@@ -238,6 +258,16 @@ try {
         } "Explorer did not display the expected result for round $round, query '$searchText'."
         $explorer.Refresh()
         $ioEnd = [ExplorerViewOwner]::ReadIo($explorer.Handle)
+        $cpuElapsed = $explorer.TotalProcessorTime.TotalMilliseconds - $cpuStart
+        if ($CheckSearchReplacement) {
+            Start-Sleep -Milliseconds 600
+            $currentList = [Windows.Automation.AutomationElement]::FromHandle($window).FindFirst($scope, $listPane)
+            if (!$currentList -or !$currentList.FindFirst($scope, $expectedItem) -or
+                $currentList.FindFirst($scope, $earlierItem) -or
+                !([string]$view.LocationName).Contains($locationNeedle)) {
+                throw 'The earlier search replaced or contaminated the final results.'
+            }
+        }
         $result = [pscustomobject]@{
             Round = $round
             ExplorerPID = $owner
@@ -247,7 +277,7 @@ try {
             Operation = $(if ($Search) { 'Search' } else { 'Navigation' })
             FirstItemMs = [Math]::Round($sample.First, 2)
             FullCountMs = [Math]::Round($total, 2)
-            ProcessCpuMs = [Math]::Round($explorer.TotalProcessorTime.TotalMilliseconds - $cpuStart, 2)
+            ProcessCpuMs = [Math]::Round($cpuElapsed, 2)
             PeakWorkingSetBytes = $explorer.PeakWorkingSet64
             PrivateBytes = $explorer.PrivateMemorySize64
             ProcessReads = $ioEnd.Reads - $ioStart.Reads
@@ -258,13 +288,17 @@ try {
         if ($labReady) {
             $hits = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits') -
                     $hitsBefore
-            if ($hits -ne [int]$active) {
+            if ((!$CheckSearchReplacement -and $hits -ne [int]($active -or $CompareShortTimer)) -or
+                ($CheckSearchReplacement -and $hits -notin 1,2)) {
                 throw "Unexpected number of search timer adjustments: $hits."
             }
             $result | Add-Member -NotePropertyMembers @{
-                SearchTimerMode = $(if ($active) { 'Adjusted' } else { 'PassThrough' })
+                SearchTimerMode = $(if ($CompareShortTimer) {
+                    if ($active) { '10ms' } else { '100ms' }
+                } elseif ($active) { 'Adjusted' } else { 'PassThrough' })
                 SearchTimerAdjustments = $hits
                 SearchQuery = $searchText
+                EarlierQueryGapMs = $editGap
             }
         }
         if ($SearchRename) {
