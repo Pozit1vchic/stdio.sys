@@ -5,6 +5,7 @@ typedef struct {
     DWORD cluster;
     ULONGLONG allocated;
     const volatile LONG *running;
+    void (*first_entry)(void);
 } WALK_PROPERTIES;
 
 static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
@@ -15,6 +16,10 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     ULONGLONG size, allocation = 0;
     DWORD error;
     UNREFERENCED_PARAMETER(parent);
+    if (properties->first_entry) {
+        properties->first_entry();
+        properties->first_entry = NULL;
+    }
     if (properties->running && !ReadAcquire(properties->running))
         return ERROR_CANCELLED;
     /* The Shell's reparse and provider rules are independent of the engine walk. */
@@ -38,12 +43,12 @@ static DWORD collect_entry(void *context, HANDLE directory, ULONGLONG parent,
     return ERROR_SUCCESS;
 }
 
-DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, ULONGLONG *files,
+DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*first_entry)(void), ULONGLONG *files,
                              ULONGLONG *folders, ULONGLONG *bytes, ULONGLONG *allocated)
 {
     wchar_t volume[MAX_PATH];
     DWORD sectors, sector_bytes, free_clusters, clusters;
-    WALK_PROPERTIES properties = { .running = running };
+    WALK_PROPERTIES properties = { .running = running, .first_entry = first_entry };
     ULONGLONG id;
     TREE_RESULT totals;
     DWORD error;
@@ -70,5 +75,5 @@ __declspec(dllexport) DWORD WINAPI ShellFolderWalkCompare(PCWSTR path, ULONGLONG
                                                           ULONGLONG *folders, ULONGLONG *bytes,
                                                           ULONGLONG *allocated)
 {
-    return folder_walk_properties(path, NULL, files, folders, bytes, allocated);
+    return folder_walk_properties(path, NULL, NULL, files, folders, bytes, allocated);
 }

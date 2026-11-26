@@ -17,6 +17,7 @@ static SHELL_STREAMS original;
 static HRESULT (*original_walk)(void *, PCWSTR);
 static volatile LONG hits;
 static volatile LONG walk_fallbacks;
+static volatile LONG walk_cancelled;
 static volatile LONG requests;
 static volatile LONG pause_claimed;
 static volatile LONG passthrough;
@@ -24,8 +25,16 @@ static HANDLE resume_first;
 static HANDLE size_worker;
 static BOOL explorer_host;
 
-DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, ULONGLONG *files,
+DWORD folder_walk_properties(PCWSTR path, const volatile LONG *running, void (*first_entry)(void), ULONGLONG *files,
                              ULONGLONG *folders, ULONGLONG *bytes, ULONGLONG *allocated);
+
+static void pause_walk_entry(void)
+{
+    if (InterlockedExchange(&pause_claimed, 1) == 0) {
+        InterlockedIncrement(&requests);
+        WaitForSingleObject(resume_first, 10000);
+    }
+}
 
 static HRESULT walk_folder(void *shell_context, PCWSTR path)
 {
@@ -35,9 +44,12 @@ static HRESULT walk_folder(void *shell_context, PCWSTR path)
     DWORD error;
     if (ReadAcquire(&passthrough) || !wcsstr(path, L"\\stdio-properties-"))
         return original_walk(shell_context, path);
-    error = folder_walk_properties(path, running, &files, &folders, &bytes, &allocated);
-    if (!ReadAcquire(running))
+    error = folder_walk_properties(path, running, resume_first ? pause_walk_entry : NULL,
+                                   &files, &folders, &bytes, &allocated);
+    if (error == ERROR_CANCELLED || !ReadAcquire(running)) {
+        InterlockedIncrement(&walk_cancelled);
         return E_ABORT;
+    }
     if (error || files > MAXDWORD - *(DWORD *)(state + 0x20) ||
         folders > MAXDWORD - *(DWORD *)(state + 0x24) ||
         bytes > MAXULONGLONG - *(ULONGLONG *)(state + 0x10) ||
@@ -271,8 +283,9 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
         if (message->message == RegisterWindowMessageW(L"stdio.shell.stream.lab.2026") &&
             message->wParam == GetCurrentProcessId() && message->hwnd != GetShellWindow()) {
             if (message->lParam == 1 || message->lParam == 2 ||
-                message->lParam == 5 || message->lParam == 6) {
-                DWORD result = install(message->lParam == 2 || message->lParam == 6, FALSE, TRUE,
+                message->lParam == 5 || message->lParam == 6 || message->lParam == 8) {
+                DWORD result = install(message->lParam == 2 || message->lParam == 6,
+                                       message->lParam == 8, TRUE,
                                        message->lParam >= 5);
                 SetPropW(message->hwnd, L"stdio.lab.install", (HANDLE)((UINT_PTR)result + 1));
             } else if (message->lParam == 3) {
@@ -284,6 +297,13 @@ __declspec(dllexport) LRESULT CALLBACK ShellStreamLabWindowHook(int code, WPARAM
             } else if (message->lParam == 7) {
                 SetPropW(message->hwnd, L"stdio.lab.walk-fallbacks",
                          (HANDLE)((UINT_PTR)ReadAcquire(&walk_fallbacks) + 1));
+            } else if (message->lParam == 9) {
+                SetPropW(message->hwnd, L"stdio.lab.paused", (HANDLE)((UINT_PTR)ReadAcquire(&requests) + 1));
+            } else if (message->lParam == 10) {
+                ShellStreamLabResume();
+                SetPropW(message->hwnd, L"stdio.lab.resumed", (HANDLE)(UINT_PTR)1);
+            } else if (message->lParam == 11) {
+                SetPropW(message->hwnd, L"stdio.lab.cancelled", (HANDLE)((UINT_PTR)ReadAcquire(&walk_cancelled) + 1));
             }
         }
     }

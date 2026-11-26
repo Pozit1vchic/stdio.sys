@@ -6,12 +6,16 @@ param(
     [switch]$LabFullWalk,
     [switch]$Junction,
     [switch]$DeniedDirectory,
+    [switch]$CheckWalkCancellation,
     [ValidateRange(1, 50000)][int]$FileCount = 1
 )
 
 # Run with Windows PowerShell -STA on an interactive desktop.
 $ErrorActionPreference = 'Stop'
 $expectFallback = $Junction -or $DeniedDirectory
+if ($CheckWalkCancellation -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough -or $expectFallback)) {
+    throw 'Cancellation requires the active full walk with a regular directory.'
+}
 if (($Junction -and $DeniedDirectory) -or
     ($expectFallback -and (!$LabDll -or !$LabFullWalk -or $LabPassThrough))) {
     throw 'Select at most one fallback fixture, with the active full-walk experiment.'
@@ -214,6 +218,7 @@ try {
         [IO.File]::Copy($source, $dll)
         $command = if ($LabFullWalk) { 5 } else { 1 }
         if ($LabPassThrough) { $command++ }
+        if ($CheckWalkCancellation) { $command = 8 }
         $result = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, $command, 'stdio.lab.install')
         if ($result) { throw "The Explorer experiment refused to install, Win32 error $result." }
     }
@@ -227,6 +232,35 @@ try {
     $dialogHandle = [IntPtr]$dialog.Current.NativeWindowHandle
     if ($dialog.Current.ProcessId -ne $owner) {
         throw 'Properties ran in a different process from the isolated Explorer window.'
+    }
+
+    if ($CheckWalkCancellation) {
+        [void](Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 9, 'stdio.lab.paused') -eq 1
+        } 'The recursive walk did not reach its first entry.')
+        $closeClock = [Diagnostics.Stopwatch]::StartNew()
+        if (![ExplorerProcessProbe]::PostMessage($dialogHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) {
+            throw 'Could not close the paused properties dialog.'
+        }
+        [void](Wait-For { !(Find-PropertiesWindow) } 'The dialog did not close before resuming the walk.' 10)
+        $closeMs = $closeClock.Elapsed.TotalMilliseconds
+        $dialogHandle = [IntPtr]::Zero
+        [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 10, 'stdio.lab.resumed')
+        [void](Wait-For {
+            [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 11, 'stdio.lab.cancelled') -eq 1
+        } 'The walk did not report cancellation.' 10)
+        $hits = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 3, 'stdio.lab.hits')
+        $fallbacks = [ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 7, 'stdio.lab.walk-fallbacks')
+        if ($hits -or $fallbacks) { throw 'The cancelled walk committed results or called the stock walk.' }
+        [pscustomobject]@{
+            ExplorerPID = $owner
+            Files = $FileCount
+            CloseMilliseconds = [Math]::Round($closeMs, 2)
+            Cancelled = 1
+            OptimizedRequests = $hits
+            WalkFallbacks = $fallbacks
+        }
+        return
     }
 
     $fields = Wait-For {
@@ -345,7 +379,12 @@ try {
     }
 } finally {
     if ($dll -and $view) {
-        try { [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled') }
+        try {
+            [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 4, 'stdio.lab.disabled')
+            if ($CheckWalkCancellation) {
+                [void][ExplorerProcessProbe]::LabCommand($window, $owner, $dll, 10, 'stdio.lab.resumed')
+            }
+        }
         catch { Write-Warning "Could not disable the experimental path: $_" }
     }
     if ($dialogHandle -ne [IntPtr]::Zero) {
