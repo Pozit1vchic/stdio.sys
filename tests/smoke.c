@@ -4,6 +4,7 @@
 #include <wchar.h>
 #include "../src/engine.h"
 #include "../src/copy_budget.h"
+#include "../src/directory_search.h"
 #include "../src/native_stat.h"
 
 static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
@@ -15,6 +16,55 @@ static BOOL make_file(const wchar_t *path, const char *data, DWORD length)
         return FALSE;
     ok = WriteFile(file, data, length, &written, NULL) && written == length;
     return CloseHandle(file) && ok;
+}
+
+static BOOL shell_result_is(IShellItemArray *items, PCWSTR expected)
+{
+    IShellItem *item = NULL;
+    PWSTR path = NULL;
+    DWORD count;
+    BOOL ok = items && SUCCEEDED(IShellItemArray_GetCount(items, &count)) && count == 1 &&
+              SUCCEEDED(IShellItemArray_GetItemAt(items, 0, &item)) &&
+              SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &path)) &&
+              !wcscmp(path, expected);
+    CoTaskMemFree(path);
+    if (item)
+        IShellItem_Release(item);
+    return ok;
+}
+
+static BOOL directory_search_test(PCWSTR root, PCWSTR original)
+{
+    wchar_t renamed[MAX_PATH];
+    DIRECTORY_SEARCH *search = NULL;
+    IShellItemArray *items = NULL;
+    BOOL moved = FALSE, ok = FALSE;
+    if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)))
+        return FALSE;
+    swprintf_s(renamed, ARRAYSIZE(renamed), L"%ls\\новое.txt", root);
+    if (FAILED(directory_search_open(root, &search)) ||
+        directory_search_exact(search, L"ТЕСТ.TXT", &items) != S_OK ||
+        !shell_result_is(items, original) ||
+        directory_search_exact(search, L"*.txt", &items) != E_INVALIDARG ||
+        !shell_result_is(items, original))
+        goto done;
+    IShellItemArray_Release(items);
+    items = NULL;
+    moved = MoveFileW(original, renamed);
+    if (!moved || directory_search_exact(search, L"тест.txt", &items) != S_FALSE || items ||
+        directory_search_exact(search, L"НОВОЕ.TXT", &items) != S_OK)
+        goto done;
+    directory_search_close(search);
+    search = NULL;
+    ok = shell_result_is(items, renamed);
+done:
+    if (items)
+        IShellItemArray_Release(items);
+    directory_search_close(search);
+    if (moved && !MoveFileW(renamed, original))
+        ok = FALSE;
+    CoUninitialize();
+    return ok;
 }
 
 typedef struct {
@@ -374,6 +424,10 @@ int wmain(int argc, wchar_t **argv)
         tree_run(root, FALSE, 0, &result) || result.files != 2 || result.bytes != 16 ||
         FAILED(test_command(argv[1], root))) {
         fputws(L"Enumeration, hard link or Explorer command failed.\n", stderr);
+        goto cleanup;
+    }
+    if (!directory_search_test(root, source)) {
+        fputws(L"Exact Shell result or refresh after rename failed.\n", stderr);
         goto cleanup;
     }
     if (plain_copy(source, copy)) {

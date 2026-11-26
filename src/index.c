@@ -1,5 +1,8 @@
+#define COBJMACROS
 #include "engine.h"
+#include "directory_search.h"
 #include "native_stat.h"
+#include <shlobj.h>
 #include <winioctl.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -14,6 +17,7 @@
 #define EXACT_INDEX_BYTES (8 * 1024 * 1024)
 #define NOTIFICATION_BYTES (64 * 1024)
 #define MAX_DIRTY_DIRECTORIES 16
+#define SHELL_SNAPSHOT_ENTRIES 100000
 
 typedef struct {
     DWORDLONG id;
@@ -61,8 +65,15 @@ typedef struct {
     DWORD watched_volume;
     ULONGLONG full_refreshes, refreshed_directories;
     DWORD search_workers;
+    BOOL shell_scope;
     TREE_RESULT totals;
 } INDEX;
+
+struct DIRECTORY_SEARCH {
+    INDEX index;
+    wchar_t *path, *prefix;
+    BOOL ready;
+};
 
 /* Only reject ASCII names here. Windows remains responsible for ordinal matching. */
 static DWORD name_signature(const wchar_t *name, DWORD non_ascii)
@@ -356,7 +367,7 @@ static BOOL contains(const wchar_t *value, const wchar_t *needle)
 }
 
 static BOOL verify_match(const INDEX_ENTRY *entry, wchar_t *path, ULONGLONG min_size,
-                         ULONGLONG max_size, ULONGLONG *size)
+                         ULONGLONG max_size, ULONGLONG *size, DWORD *attributes)
 {
     BY_HANDLE_FILE_INFORMATION info;
     NATIVE_FILE_STAT stat;
@@ -369,11 +380,15 @@ static BOOL verify_match(const INDEX_ENTRY *entry, wchar_t *path, ULONGLONG min_
         ok = TRUE;
         id = (DWORDLONG)stat.file_id.QuadPart;
         *size = (ULONGLONG)stat.end_of_file.QuadPart;
+        if (attributes)
+            *attributes = stat.attributes;
     } else {
         ok = GetFileInformationByHandle(handle, &info);
         if (ok) {
             id = ((DWORDLONG)info.nFileIndexHigh << 32) | info.nFileIndexLow;
             *size = ((ULONGLONG)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+            if (attributes)
+                *attributes = info.dwFileAttributes;
         }
     }
     CloseHandle(handle);
@@ -391,7 +406,7 @@ static const wchar_t *lookup_match(const SEARCH_QUERY *query, const INDEX_ENTRY 
 {
     wchar_t *path = entry_path_cached(query->index, entry, buffer, cache);
     if (!path || (query->path_needle && !contains(path + 4, query->path_needle)) ||
-        !verify_match(entry, path, query->low, query->high, size))
+        !verify_match(entry, path, query->low, query->high, size, NULL))
         return NULL;
     return path;
 }
@@ -439,7 +454,7 @@ static size_t count_batch(const SEARCH_QUERY *query, const INDEX_ENTRY *const *e
     return matches;
 }
 
-static BOOL can_use_search_workers(void)
+static BOOL uses_process_token(void)
 {
     HANDLE token;
     /* Pool callbacks use the process token. Preserve a caller's thread token. */
@@ -563,7 +578,7 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
             pending[pending_count++] = entry;
             if (pending_count == SEARCH_BATCH_SIZE) {
                 if (!pool_attempted) {
-                    DWORD limit = can_use_search_workers() ? index->search_workers : 1;
+                    DWORD limit = uses_process_token() ? index->search_workers : 1;
                     pool_attempted = TRUE;
                     while (worker_count < limit) {
                         SEARCH_WORKER *worker = &workers[worker_count];
@@ -604,6 +619,13 @@ static DWORD search(INDEX *index, wchar_t *mode, wchar_t *value, BOOL count_only
     return ERROR_SUCCESS;
 }
 
+static BOOL snapshot_entry_supported(const INDEX *index, DWORD attributes)
+{
+    return !index->shell_scope ||
+           (index->file_count + index->live < SHELL_SNAPSHOT_ENTRIES &&
+            !(attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)));
+}
+
 static DWORD snapshot_file(INDEX *index, ULONGLONG parent, DWORDLONG id, const FILE_ID_EXTD_DIR_INFO *entry)
 {
     const size_t length = entry->FileNameLength / sizeof(wchar_t);
@@ -611,6 +633,8 @@ static DWORD snapshot_file(INDEX *index, ULONGLONG parent, DWORDLONG id, const F
                      0 : (ULONGLONG)entry->EndOfFile.QuadPart;
     NAME_BLOCK *block;
     wchar_t *name;
+    if (!snapshot_entry_supported(index, entry->FileAttributes))
+        return ERROR_NOT_SUPPORTED;
     if (index->file_count == index->file_capacity) {
         size_t capacity = index->file_capacity ? index->file_capacity * 2 : 256;
         INDEX_ENTRY *files = capacity <= SIZE_MAX / sizeof(*files) ?
@@ -650,9 +674,12 @@ static DWORD snapshot_entry(void *context, HANDLE directory, ULONGLONG parent,
     INDEX *index = context;
     DWORDLONG id;
     memcpy(&id, entry->FileId.Identifier, sizeof(id));
-    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    if (entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        if (!snapshot_entry_supported(index, entry->FileAttributes))
+            return ERROR_NOT_SUPPORTED;
         return update_entry(index, id, parent, 0, entry->FileAttributes, entry->FileName,
                             (USHORT)entry->FileNameLength);
+    }
     return snapshot_file(index, parent, id, entry);
 }
 
@@ -973,76 +1000,205 @@ static DWORD commands(INDEX *index, const wchar_t *storage_path)
     return error;
 }
 
-DWORD directory_index_console(const wchar_t *input)
+static DWORD open_directory_scope(DIRECTORY_SEARCH *scope, const wchar_t *input)
 {
-    INDEX index = { .directory_watch = INVALID_HANDLE_VALUE };
-    wchar_t *path = malloc(PATH_CHARS * sizeof(*path));
-    wchar_t *prefix = NULL;
+    INDEX *index = &scope->index;
+    wchar_t *path = scope->path = malloc(PATH_CHARS * sizeof(*path));
     BY_HANDLE_FILE_INFORMATION identity;
     DWORD length, error;
     if (!path)
         return ERROR_NOT_ENOUGH_MEMORY;
     memcpy(path, L"\\\\?\\", 4 * sizeof(*path));
     length = GetFullPathNameW(input, PATH_CHARS - 4, path + 4, NULL);
-    if (!length || length >= PATH_CHARS - 4 || length < 3 || path[5] != L':' || path[6] != L'\\') {
-        error = length ? ERROR_INVALID_NAME : GetLastError();
-        goto done;
-    }
+    if (!length || length >= PATH_CHARS - 4 || length < 3 || path[5] != L':' || path[6] != L'\\')
+        return length ? ERROR_INVALID_NAME : GetLastError();
     while (length > 3 && path[length + 3] == L'\\')
         path[--length + 4] = 0;
-    index.directory = path + 4;
-    index.watch_path = path;
-    error = directory_identity(path, &index.watched_root, &index.watched_volume);
+    index->directory = path + 4;
+    index->watch_path = path;
+    if (index->shell_scope) {
+        wchar_t fs[16];
+        HANDLE handle;
+        UINT type = GetDriveTypeW((wchar_t[]){path[4], L':', L'\\', 0});
+        if ((type != DRIVE_FIXED && type != DRIVE_REMOVABLE) || wcschr(path + 7, L':'))
+            return ERROR_NOT_SUPPORTED;
+        error = open_indexed_file(path, &handle);
+        if (error)
+            return error;
+        if (!GetVolumeInformationByHandleW(handle, NULL, 0, NULL, NULL, NULL, fs, ARRAYSIZE(fs)))
+            error = GetLastError();
+        else if (wcscmp(fs, L"NTFS"))
+            error = ERROR_NOT_SUPPORTED;
+        CloseHandle(handle);
+        if (error)
+            return error;
+    }
+    error = directory_identity(path, &index->watched_root, &index->watched_volume);
     if (error)
-        goto done;
-    index.directory_watch = CreateFileW(path, FILE_LIST_DIRECTORY,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
-                                        FILE_FLAG_OVERLAPPED, NULL);
-    if (index.directory_watch == INVALID_HANDLE_VALUE ||
-        !GetFileInformationByHandle(index.directory_watch, &identity)) {
-        error = GetLastError();
-        goto done;
-    }
-    if ((((DWORDLONG)identity.nFileIndexHigh << 32) | identity.nFileIndexLow) != index.watched_root ||
-        identity.dwVolumeSerialNumber != index.watched_volume) {
-        error = ERROR_RETRY;
-        goto done;
-    }
-    index.notification.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!index.notification.hEvent) {
-        error = GetLastError();
-        goto done;
-    }
-    prefix = _wcsdup(path);
-    index.buffer = malloc(NOTIFICATION_BYTES);
-    if (!prefix || !index.buffer) {
-        error = ERROR_NOT_ENOUGH_MEMORY;
-        goto done;
-    }
+        return error;
+    index->directory_watch = CreateFileW(path, FILE_LIST_DIRECTORY,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT |
+                                         FILE_FLAG_OVERLAPPED, NULL);
+    if (index->directory_watch == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(index->directory_watch, &identity))
+        return GetLastError();
+    if ((((DWORDLONG)identity.nFileIndexHigh << 32) | identity.nFileIndexLow) != index->watched_root ||
+        identity.dwVolumeSerialNumber != index->watched_volume)
+        return ERROR_RETRY;
+    index->notification.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!index->notification.hEvent)
+        return GetLastError();
+    scope->prefix = _wcsdup(path);
+    index->buffer = malloc(NOTIFICATION_BYTES);
+    if (!scope->prefix || !index->buffer)
+        return ERROR_NOT_ENOUGH_MEMORY;
     /* Omit the drive root's trailing slash when composing paths. */
     if (length == 3)
-        prefix[6] = 0;
-    index.prefix = prefix;
-    error = arm_directory_watch(&index);
-    if (!error)
-        error = commands(&index, index.directory);
-done:
-    if (index.watch_pending) {
+        scope->prefix[6] = 0;
+    index->prefix = scope->prefix;
+    return arm_directory_watch(index);
+}
+
+static void close_directory_scope(DIRECTORY_SEARCH *scope)
+{
+    INDEX *index = &scope->index;
+    if (index->watch_pending) {
         DWORD bytes;
-        CancelIoEx(index.directory_watch, &index.notification);
-        GetOverlappedResult(index.directory_watch, &index.notification, &bytes, TRUE);
+        CancelIoEx(index->directory_watch, &index->notification);
+        GetOverlappedResult(index->directory_watch, &index->notification, &bytes, TRUE);
     }
-    if (index.directory_watch != INVALID_HANDLE_VALUE)
-        CloseHandle(index.directory_watch);
-    if (index.notification.hEvent)
-        CloseHandle(index.notification.hEvent);
-    clear_entries(&index);
-    free(index.buffer);
-    free(prefix);
-    free(path);
+    if (index->directory_watch != INVALID_HANDLE_VALUE)
+        CloseHandle(index->directory_watch);
+    if (index->notification.hEvent)
+        CloseHandle(index->notification.hEvent);
+    clear_entries(index);
+    free(index->buffer);
+    free(scope->prefix);
+    free(scope->path);
+}
+
+DWORD directory_index_console(const wchar_t *input)
+{
+    DIRECTORY_SEARCH scope = { .index = { .directory_watch = INVALID_HANDLE_VALUE } };
+    DWORD error = open_directory_scope(&scope, input);
+    if (!error)
+        error = commands(&scope.index, scope.index.directory);
+    close_directory_scope(&scope);
     return error;
 }
+
+HRESULT directory_search_open(PCWSTR path, DIRECTORY_SEARCH **search)
+{
+    DIRECTORY_SEARCH *scope;
+    DWORD error;
+    if (!path || !*path || !search || path[1] != L':' || path[2] != L'\\')
+        return E_INVALIDARG;
+    if (!uses_process_token())
+        return E_ACCESSDENIED;
+    scope = calloc(1, sizeof(*scope));
+    if (!scope)
+        return E_OUTOFMEMORY;
+    scope->index.directory_watch = INVALID_HANDLE_VALUE;
+    scope->index.shell_scope = TRUE;
+    error = open_directory_scope(scope, path);
+    if (error) {
+        directory_search_close(scope);
+        return HRESULT_FROM_WIN32(error);
+    }
+    *search = scope;
+    return S_OK;
+}
+
+void directory_search_close(DIRECTORY_SEARCH *search)
+{
+    if (search) {
+        close_directory_scope(search);
+        free(search);
+    }
+}
+
+static HRESULT verified_item_id(const INDEX *index, const INDEX_ENTRY *entry,
+                                wchar_t *buffer, PIDLIST_ABSOLUTE *id)
+{
+    wchar_t *path = entry_path_cached(index, entry, buffer, NULL), *actual = NULL;
+    ULONGLONG size;
+    DWORD attributes;
+    HRESULT hr;
+    if (!path || !verify_match(entry, path, 0, MAXULONGLONG, &size, &attributes) ||
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)))
+        return HRESULT_FROM_WIN32(ERROR_RETRY);
+    hr = SHParseDisplayName(path + 4, NULL, id, 0, NULL);
+    if (SUCCEEDED(hr))
+        hr = SHGetNameFromIDList(*id, SIGDN_FILESYSPATH, &actual);
+    if (SUCCEEDED(hr) && wcscmp(path + 4, actual))
+        hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    CoTaskMemFree(actual);
+    if (FAILED(hr)) {
+        CoTaskMemFree(*id);
+        *id = NULL;
+    }
+    return hr;
+}
+
+HRESULT directory_search_exact(DIRECTORY_SEARCH *search, PCWSTR name, IShellItemArray **items)
+{
+    INDEX *index;
+    PIDLIST_ABSOLUTE *ids = NULL;
+    IShellItemArray *array = NULL;
+    wchar_t *buffer = NULL;
+    size_t first, count, parsed = 0;
+    DWORD error;
+    HRESULT hr = S_FALSE;
+    if (!search || !name || !*name || !items || wcspbrk(name, L"\\/:*?\"<>|") ||
+        !wcscmp(name, L".") || !wcscmp(name, L".."))
+        return E_INVALIDARG;
+    if (!uses_process_token())
+        return E_ACCESSDENIED;
+    index = &search->index;
+    error = snapshot_refresh(index, !search->ready);
+    search->ready = !error;
+    if (error || !index->watch_pending)
+        return HRESULT_FROM_WIN32(error ? error : ERROR_RETRY);
+    build_exact_names(index, index->files, index->file_count);
+    if (index->file_count && !index->exact_names)
+        return E_OUTOFMEMORY;
+    first = exact_name_bound(index, name, FALSE);
+    count = exact_name_bound(index, name, TRUE) - first;
+    if (count) {
+        ids = calloc(count, sizeof(*ids));
+        buffer = malloc(PATH_CHARS * sizeof(*buffer));
+        if (!ids || !buffer) {
+            hr = E_OUTOFMEMORY;
+            goto done;
+        }
+        for (; parsed < count; ++parsed) {
+            const INDEX_ENTRY *entry = index->exact_names[first + parsed];
+            hr = verified_item_id(index, entry, buffer, &ids[parsed]);
+            if (FAILED(hr))
+                goto done;
+        }
+        hr = SHCreateShellItemArrayFromIDLists((UINT)count, (PCIDLIST_ABSOLUTE *)ids, &array);
+    }
+    if (SUCCEEDED(hr)) {
+        DWORD state = WaitForSingleObject(index->notification.hEvent, 0);
+        if (state == WAIT_TIMEOUT) {
+            *items = array;
+            array = NULL;
+        } else {
+            hr = HRESULT_FROM_WIN32(state == WAIT_FAILED ? GetLastError() : ERROR_RETRY);
+        }
+    }
+done:
+    if (array)
+        IShellItemArray_Release(array);
+    while (parsed)
+        CoTaskMemFree(ids[--parsed]);
+    free(ids);
+    free(buffer);
+    return hr;
+}
+
 
 DWORD index_console(const wchar_t *drive)
 {
