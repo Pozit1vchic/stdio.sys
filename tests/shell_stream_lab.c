@@ -1,5 +1,6 @@
 #include "folder_streams.h"
 #include "folder_walk_lab.h"
+#include "exact_name_query.h"
 #include <bcrypt.h>
 #include <stdint.h>
 #include <string.h>
@@ -211,23 +212,22 @@ static BYTE *search_shell;
 static int32_t search_notify_operand, search_timer_operand;
 static DWORD search_thread;
 static volatile LONG search_timer_enabled, search_timer_hits;
-static _Thread_local BOOL fixture_search;
+static _Thread_local BOOL exact_search;
 
 static HRESULT search_notify(void *view, PCWSTR text, PCWSTR stripped, DWORD flags)
 {
-    static const wchar_t query[] = L"System.FileName:=\"fixture-00000.bin\"";
-    BOOL previous = fixture_search;
+    BOOL previous = exact_search;
     HRESULT result;
-    fixture_search = ReadAcquire(&search_timer_enabled) && GetCurrentThreadId() == search_thread &&
-                     flags == 1 && text && stripped && !wcscmp(text, query) && !wcscmp(stripped, query);
+    exact_search = ReadAcquire(&search_timer_enabled) && GetCurrentThreadId() == search_thread &&
+                   flags == 1 && exact_name_query(text, NULL, NULL) && stripped && !wcscmp(text, stripped);
     result = stock_search_notify(view, text, stripped, flags);
-    fixture_search = previous;
+    exact_search = previous;
     return result;
 }
 
 static UINT_PTR WINAPI search_timer(HWND window, UINT_PTR id, UINT delay, TIMERPROC callback)
 {
-    BOOL adjust = fixture_search && id == 5 && delay == 500 && !callback &&
+    BOOL adjust = exact_search && id == 5 && delay == 500 && !callback &&
                   GetAncestor(window, GA_ROOT) == search_window;
     UINT_PTR timer = stock_search_timer(window, id, adjust ? 100 : delay, callback);
     if (adjust && timer)

@@ -1,6 +1,7 @@
 #define COBJMACROS
 #include "engine.h"
 #include "directory_search.h"
+#include "exact_name_query.h"
 #include "native_stat.h"
 #include <shlobj.h>
 #include <winioctl.h>
@@ -1158,9 +1159,6 @@ static HRESULT search_exact_name(DIRECTORY_SEARCH *search, PCWSTR name, IShellIt
     size_t first, count, parsed = 0;
     DWORD error;
     HRESULT hr = S_FALSE;
-    if (!name || !*name || wcspbrk(name, L"\\/:*?\"<>|") ||
-        !wcscmp(name, L".") || !wcscmp(name, L".."))
-        return E_INVALIDARG;
     if (!uses_process_token())
         return E_ACCESSDENIED;
     index = &search->index;
@@ -1211,20 +1209,16 @@ done:
 HRESULT directory_search_condition(DIRECTORY_SEARCH *search, PCWSTR query, ICondition *condition,
                                    IShellItemArray **items)
 {
-    static const WCHAR prefix[] = L"System.FileName:=\"";
-    const size_t prefix_length = ARRAYSIZE(prefix) - 1;
-    WCHAR name[256];
+    PCWSTR component;
+    WCHAR name[EXACT_NAME_LIMIT + 1];
     CONDITION_TYPE type;
     CONDITION_OPERATION operation;
     PWSTR property = NULL;
-    size_t length, name_length;
+    size_t name_length;
     HRESULT hr;
     if (!search || !query || !condition || !items)
         return E_INVALIDARG;
-    length = wcslen(query);
-    if (length <= prefix_length + 1 || length > prefix_length + ARRAYSIZE(name) ||
-        query[length - 1] != L'"' ||
-        CompareStringOrdinal(query, (int)prefix_length, prefix, (int)prefix_length, TRUE) != CSTR_EQUAL)
+    if (!exact_name_query(query, &component, &name_length))
         return E_NOTIMPL;
     hr = ICondition_GetConditionType(condition, &type);
     if (FAILED(hr) || type != CT_LEAF_CONDITION)
@@ -1233,8 +1227,7 @@ HRESULT directory_search_condition(DIRECTORY_SEARCH *search, PCWSTR query, ICond
     if (SUCCEEDED(hr)) {
         if (operation == COP_EQUAL && property &&
             CompareStringOrdinal(property, -1, L"System.FileName", -1, TRUE) == CSTR_EQUAL) {
-            name_length = length - prefix_length - 1;
-            wmemcpy(name, query + prefix_length, name_length);
+            wmemcpy(name, component, name_length);
             name[name_length] = 0;
             hr = search_exact_name(search, name, items);
         } else {

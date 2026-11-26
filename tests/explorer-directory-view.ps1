@@ -58,14 +58,14 @@ function Find-TestWindow($Shell, [string]$Path) {
     }
 }
 
-function Wait-TestValue([scriptblock]$Read) {
+function Wait-TestValue([scriptblock]$Read, [string]$TimeoutMessage = 'The Explorer view did not reach the expected state.') {
     $timeout = [Diagnostics.Stopwatch]::StartNew()
     do {
         $value = & $Read
         if ($value) { return $value }
         Start-Sleep -Milliseconds 10
     } while ($timeout.ElapsedMilliseconds -lt 15000)
-    throw 'The Explorer view did not reach the expected state.'
+    throw $TimeoutMessage
 }
 
 function New-Condition($Property, $Value) {
@@ -89,11 +89,7 @@ $listPane = New-Condition ([Windows.Automation.AutomationElement]::AutomationIdP
 $expectedCount = if ($Search) { 1 } else { $FileCount }
 $view = $null
 $labReady = $false
-$searchText = if ($LabSearchDll -and !$CheckSearchFallback) {
-    'System.FileName:="fixture-00000.bin"'
-} else {
-    'fixture-00000'
-}
+$unicodeName = 'fixture-00000 - ' + [char]0x041B + [char]0x0435 + [char]0x0441 + '.bin'
 
 function Open-SearchBox {
     $view.Navigate2($target)
@@ -106,7 +102,7 @@ function Open-SearchBox {
         if ($value -and ($value.Current.Name -replace '[^0-9]', '') -eq [string]$directoryCount) {
             $ui.FindFirst($scope, $searchEdit)
         }
-    }
+    } 'Explorer did not finish opening the search fixture.'
     $box.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
 }
 
@@ -160,17 +156,55 @@ try {
         [IO.File]::WriteAllBytes((Join-Path $target ('fixture-{0:d5}.bin' -f $i)), $data)
     }
     if ($labReady -and !$CheckSearchFallback) {
-        $nearPath = Join-Path $target ($originalName + '.bak')
-        [IO.File]::WriteAllBytes($nearPath, $data)
-        ++$directoryCount
+        $extraPaths = @(
+            (Join-Path $target $unicodeName)
+            (Join-Path $target ($originalName + '.bak'))
+            (Join-Path $target ($unicodeName + '.bak'))
+        )
+        foreach ($path in $extraPaths) { [IO.File]::WriteAllBytes($path, $data) }
+        $directoryCount += $extraPaths.Count
+    }
+    if ($CheckSearchFallback) {
+        [void][ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 16, 'stdio.lab.search-mode')
+        $controls = @(
+            'fixture-00000'
+            'System.FileName:="fixture-00000.bin'
+            'System.FileName:="fixture-00000.*"'
+            'System.FileName:="fixture-00000.bin" AND System.Size:>=0'
+        )
+        for ($round = 1; $round -le $Rounds; $round++) {
+            foreach ($searchText in $controls) {
+                [void](Wait-TestValue { !$view.Busy -and $view.Document.Folder.Self.Path -eq $control })
+                $searchValue = Open-SearchBox
+                $before = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits')
+                $searchValue.SetValue($searchText)
+                Start-Sleep -Milliseconds 750
+                $hits = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits') - $before
+                if ($hits) { throw "The search timer changed for unsupported input: $searchText." }
+                [pscustomobject]@{
+                    Round = $round
+                    SearchQuery = $searchText
+                    SearchTimerMode = 'Fallback'
+                    SearchTimerAdjustments = $hits
+                }
+                $view.Navigate2($control)
+            }
+        }
+        return
     }
     for ($round = 1; $round -le $Rounds; $round++) {
         [void](Wait-TestValue {
             !$view.Busy -and $view.Document.Folder.Self.Path -eq $control
-        })
+        } "Explorer did not return to the control folder before round $round.")
         if ($Search) { $searchValue = Open-SearchBox }
+        $searchText = $locationNeedle = 'fixture-00000'
+        $expectedItem = $firstItem
         if ($labReady) {
-            $active = $CheckSearchFallback -or ($round % 4 -in 2,3)
+            $pair = [int][Math]::Floor(($round - 1) / 2)
+            $locationNeedle = if ($pair % 2) { $unicodeName } else { $originalName }
+            $expectedItem = New-Condition ([Windows.Automation.AutomationElement]::NameProperty) $locationNeedle
+            $searchText = 'System.FileName:="{0}"' -f $locationNeedle
+            $active = [bool](($pair % 4 -in 1,2) -xor ($round % 2 -eq 0))
             $command = if ($active) { 16 } else { 17 }
             [void][ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, $command, 'stdio.lab.search-mode')
             $hitsBefore = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits')
@@ -184,11 +218,11 @@ try {
         $sample = @{ First = $null }
         $total = Wait-TestValue {
             if (!$Search -and $view.Document.Folder.Self.Path -ne $target) { return }
-            if ($Search -and $view.LocationName -notlike '*fixture-00000*') { return }
+            if ($Search -and !([string]$view.LocationName).Contains($locationNeedle)) { return }
             $ui = [Windows.Automation.AutomationElement]::FromHandle($window)
             try {
                 $list = $ui.FindFirst($scope, $listPane)
-                if ($null -eq $sample.First -and $list -and $list.FindFirst($scope, $firstItem)) {
+                if ($null -eq $sample.First -and $list -and $list.FindFirst($scope, $expectedItem)) {
                     $sample.First = $clock.Elapsed.TotalMilliseconds
                 }
                 if ($null -eq $sample.First) { return }
@@ -201,7 +235,7 @@ try {
             } catch [Windows.Automation.ElementNotAvailableException] {
                 # Navigation can replace the active view during this sample.
             }
-        }
+        } "Explorer did not display the expected result for round $round, query '$searchText'."
         $explorer.Refresh()
         $ioEnd = [ExplorerViewOwner]::ReadIo($explorer.Handle)
         $result = [pscustomobject]@{
@@ -224,12 +258,11 @@ try {
         if ($labReady) {
             $hits = [ExplorerProcessProbe]::LabCommand($window, $owner, $labPath, 18, 'stdio.lab.search-hits') -
                     $hitsBefore
-            if ($hits -ne [int]($active -and !$CheckSearchFallback)) {
+            if ($hits -ne [int]$active) {
                 throw "Unexpected number of search timer adjustments: $hits."
             }
             $result | Add-Member -NotePropertyMembers @{
-                SearchTimerMode = $(if ($CheckSearchFallback) { 'Fallback' }
-                                    elseif ($active) { 'Adjusted' } else { 'PassThrough' })
+                SearchTimerMode = $(if ($active) { 'Adjusted' } else { 'PassThrough' })
                 SearchTimerAdjustments = $hits
                 SearchQuery = $searchText
             }
@@ -305,7 +338,7 @@ try {
     }
     if ($view) { $view.Quit() }
     if ([IO.Directory]::Exists($target)) {
-        if ($nearPath) { [IO.File]::Delete($nearPath) }
+        foreach ($path in $extraPaths) { [IO.File]::Delete($path) }
         if ($SearchRename) { [IO.File]::Delete((Join-Path $target $renamedName)) }
         for ($i = 0; $i -lt $FileCount; $i++) {
             [IO.File]::Delete((Join-Path $target ('fixture-{0:d5}.bin' -f $i)))
